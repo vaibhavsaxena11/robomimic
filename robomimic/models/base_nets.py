@@ -1065,6 +1065,170 @@ class VisualCore(EncoderCore, ConvBase):
         msg = header + '(' + msg + '\n)'
         return msg
 
+## TODO(VS) cleanup comments
+## PointNet (https://arxiv.org/pdf/1612.00593.pdf) ##
+## Source: https://github.com/fxia22/pointnet.pytorch/blob/f0c2430b0b1529e3f76fb5d6cd6ca14be763d975/pointnet/model.py
+class STN3d(nn.Module):
+    """ Helper class for PointNetFeat. Predicts 3x3 input transformation matrices. """
+    def __init__(self):
+        super(STN3d, self).__init__()
+        # input shape: (B, 3, N)
+        self.conv1 = torch.nn.Conv1d(3, 64, 1) # out shape: (B, 64, N)
+        self.conv2 = torch.nn.Conv1d(64, 128, 1) # out shape: (B, 128, N)
+        self.conv3 = torch.nn.Conv1d(128, 1024, 1) # out shape: (B, 1024, N)
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 9)
+        self.relu = nn.ReLU() # TODO(VS) remove
+
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
+
+    def forward(self, x):
+        # input shape: (B, 3, N)
+        batchsize = x.size()[0]
+        x = F.relu(self.bn1(self.conv1(x))) # out shape: (B, 64, N)
+        x = F.relu(self.bn2(self.conv2(x))) # out shape: (B, 128, N)
+        x = F.relu(self.bn3(self.conv3(x))) # out shape: (B, 1024, N)
+        x = torch.max(x, 2, keepdim=True)[0] # max-pool across points dimension; out shape: (B, 1024, 1)
+        x = x.view(-1, 1024) # out shape: (B, 1024)
+
+        x = F.relu(self.bn4(self.fc1(x))) # out shape: (B, 512)
+        x = F.relu(self.bn5(self.fc2(x))) # out shape: (B, 256)
+        x = self.fc3(x) # out shape: (B, 9)
+
+        iden = torch.autograd.Variable(torch.from_numpy(np.array([1,0,0,0,1,0,0,0,1]).astype(np.float32))).view(1,9).repeat(batchsize, 1)
+        if x.is_cuda:
+            iden = iden.cuda()
+        x = x + iden
+        x = x.view(-1, 3, 3)
+        return x
+
+
+class STNkd(nn.Module):
+    """ Helper class for PointNetFeat. Predicts feature transformation matrices. """
+    def __init__(self, k=64):
+        super(STNkd, self).__init__()
+        self.conv1 = torch.nn.Conv1d(k, 64, 1)
+        self.conv2 = torch.nn.Conv1d(64, 128, 1)
+        self.conv3 = torch.nn.Conv1d(128, 1024, 1)
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, k*k)
+        self.relu = nn.ReLU() # TODO(VS) remove
+
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
+
+        self.k = k
+
+    def forward(self, x):
+        batchsize = x.size()[0]
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = torch.max(x, 2, keepdim=True)[0]
+        x = x.view(-1, 1024)
+
+        x = F.relu(self.bn4(self.fc1(x)))
+        x = F.relu(self.bn5(self.fc2(x)))
+        x = self.fc3(x)
+
+        iden = torch.nn.Variable(torch.from_numpy(np.eye(self.k).flatten().astype(np.float32))).view(1,self.k*self.k).repeat(batchsize,1)
+        if x.is_cuda:
+            iden = iden.cuda()
+        x = x + iden
+        x = x.view(-1, self.k, self.k)
+        return x
+
+class PointNetFeat(nn.Module):
+    """ Helper class for PointNet. Predicts features from inputs. """
+    def __init__(self, global_feat_only=True, feature_transform=False):
+        super(PointNetFeat, self).__init__()
+        self.stn = STN3d() # input transformation class
+        self.conv1 = torch.nn.Conv1d(3, 64, 1)
+        self.conv2 = torch.nn.Conv1d(64, 128, 1)
+        self.conv3 = torch.nn.Conv1d(128, 1024, 1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.global_feat = global_feat_only
+        self.feature_transform = feature_transform
+        if self.feature_transform:
+            self.fstn = STNkd(k=64) # feature transformation class
+
+    def forward(self, x):
+        n_pts = x.size()[2]
+        trans = self.stn(x) # (B, 3, 3) input transformation matrices
+        x = x.transpose(2, 1) # (B, 3, N) -> (B, N, 3)
+        x = torch.bmm(x, trans) # (B, N, 3)
+        x = x.transpose(2, 1) # after input transform; (B, N, 3) -> (B, 3, N)
+        x = F.relu(self.bn1(self.conv1(x))) # final feature shape (B, 64, N)
+
+        if self.feature_transform:
+            trans_feat = self.fstn(x) # (B, 64, 64) feature transformation matrices
+            x = x.transpose(2, 1) # (B, 64, N) -> (B, N, 64)
+            x = torch.bmm(x, trans_feat) # (B, N, 64)
+            x = x.transpose(2, 1) # (B, N, 64) -> (B, 64, N); after feature transform
+        else:
+            trans_feat = None
+
+        pointfeat = x # final feature shape (B, 64, N)
+        x = F.relu(self.bn2(self.conv2(x))) # out shape (B, 128, N)
+        x = self.bn3(self.conv3(x)) # out shape (B, 1024, N)
+        x = torch.max(x, 2, keepdim=True)[0] # max-pool across points dimension; shape (B, 1024, 1)
+        x = x.view(-1, 1024) # shape (B, 1024)
+        if self.global_feat:
+            return x, trans, trans_feat
+        else:
+            # concatenating the max-pooled feature with the previously computed point-wise features
+            x = x.view(-1, 1024, 1).repeat(1, 1, n_pts)
+            return torch.cat([x, pointfeat], 1), trans, trans_feat
+
+## TODO(VS) remove classifier code
+# class PointNetClassifier(nn.Module):
+#     def __init__(self, classes=2, feature_transform=False):
+#         super(PointNetClassifier, self).__init__()
+#         self.feature_transform = feature_transform
+#         self.feat = PointNetFeat(global_feat=True, feature_transform=feature_transform)
+#         self.fc1 = nn.Linear(1024, 512)
+#         self.fc2 = nn.Linear(512, 256)
+#         self.fc3 = nn.Linear(256, classes)
+#         self.dropout = nn.Dropout(p=0.3)
+#         self.bn1 = nn.BatchNorm1d(512)
+#         self.bn2 = nn.BatchNorm1d(256)
+#         self.relu = nn.ReLU()
+
+#     def forward(self, x):
+#         x, trans, trans_feat = self.feat(x)
+#         x = F.relu(self.bn1(self.fc1(x)))
+#         x = F.relu(self.bn2(self.dropout(self.fc2(x))))
+#         x = self.fc3(x)
+#         return F.log_softmax(x, dim=1), trans, trans_feat
+
+## TODO(VS) refactor STN3d, STNkd, PointNetFeat, PointNetCore into a single PointNet class
+class PointCloudCore(EncoderCore):
+    def __init__(self, input_shape): #TODO(VS) add kwargs
+        super(PointCloudCore, self).__init__(input_shape)
+        self.input_shape = input_shape
+        self.pointnet = PointNetFeat(global_feat_only=True, feature_transform=False)
+
+    def output_shape(self, input_shape):
+        return [1024]
+
+    def forward(self, inputs): #TODO(VS)
+        feats, _, _ = self.pointnet(inputs)
+        return feats
+    
+    ## TODO(VS)
+    # def __repr__(self):
+    #     raise NotImplementedError
 
 """
 ================================================
