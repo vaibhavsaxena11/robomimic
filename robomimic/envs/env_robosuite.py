@@ -211,7 +211,7 @@ class EnvRobosuite(EB.EnvBase):
         for cam_name, cam_height, cam_width in zip(self.env.camera_names, self.env.camera_heights, self.env.camera_widths):
             if f"{cam_name}_depth" in ret:
                 ret[f"{cam_name}_xyz"] = self.get_xyz_from_depth(ret[f"{cam_name}_depth"], cam_name, cam_height, cam_width)
-                ret[f"{cam_name}_xyz"] = ObsUtils.process_obs(obs=ret[f"{cam_name}_xyz"], obs_key='pcd')
+                ret[f"{cam_name}_xyz"] = ObsUtils.process_obs(obs=ret[f"{cam_name}_xyz"], obs_modality='pcd')
         return ret
 
     def get_real_depth_map(self, depth_map):
