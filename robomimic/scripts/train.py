@@ -94,6 +94,8 @@ def train(config, device):
                 env_names.append(name)
 
         for env_name in env_names:
+            ## NOTE(VS): env is setup by default to output ALL observations it can. They are filtered later in the encoder, based on what is provided during training.
+            ## Only the images are a special case, which the env is setup to output only if they are present in the SequenceDataset during training as well.
             env = EnvUtils.create_env_from_metadata(
                 env_meta=env_meta,
                 env_name=env_name, 

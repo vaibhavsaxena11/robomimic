@@ -135,7 +135,7 @@ def get_shape_metadata_from_dataset(dataset_path, all_obs_keys=None, verbose=Fal
 
     shape_meta['all_shapes'] = all_shapes
     shape_meta['all_obs_keys'] = all_obs_keys
-    shape_meta['use_images'] = ObsUtils.has_modality("rgb", all_obs_keys)
+    shape_meta['use_images'] = ObsUtils.has_modality("rgb", all_obs_keys) or ObsUtils.has_modality("pcd", all_obs_keys)
 
     return shape_meta
 
