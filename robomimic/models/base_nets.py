@@ -1070,7 +1070,7 @@ class VisualCore(EncoderCore, ConvBase):
 ## Source: https://github.com/fxia22/pointnet.pytorch/blob/f0c2430b0b1529e3f76fb5d6cd6ca14be763d975/pointnet/model.py
 class STN3d(nn.Module):
     """ Helper class for PointNetFeat. Predicts 3x3 input transformation matrices. """
-    def __init__(self):
+    def __init__(self, batch_norm=True):
         super(STN3d, self).__init__()
         # input shape: (B, 3, N)
         self.conv1 = torch.nn.Conv1d(3, 64, 1) # out shape: (B, 64, N)
@@ -1079,25 +1079,37 @@ class STN3d(nn.Module):
         self.fc1 = nn.Linear(1024, 512)
         self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, 9)
-        self.relu = nn.ReLU() # TODO(VS) remove
+        self.relu = nn.ReLU()
+        self.batch_norm = batch_norm
 
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
-        self.bn4 = nn.BatchNorm1d(512)
-        self.bn5 = nn.BatchNorm1d(256)
+        self.act1 = lambda x: self.relu(x)
+        self.act2 = lambda x: self.relu(x)
+        self.act3 = lambda x: self.relu(x)
+        self.act4 = lambda x: self.relu(x)
+        self.act5 = lambda x: self.relu(x)
+        if self.batch_norm:
+            self.bn1 = nn.BatchNorm1d(64)
+            self.bn2 = nn.BatchNorm1d(128)
+            self.bn3 = nn.BatchNorm1d(1024)
+            self.bn4 = nn.BatchNorm1d(512)
+            self.bn5 = nn.BatchNorm1d(256)
+            self.act1 = lambda x: self.bn1(self.relu(x))
+            self.act2 = lambda x: self.bn2(self.relu(x))
+            self.act3 = lambda x: self.bn3(self.relu(x))
+            self.act4 = lambda x: self.bn4(self.relu(x))
+            self.act5 = lambda x: self.bn5(self.relu(x))
 
     def forward(self, x):
         # input shape: (B, 3, N)
         batchsize = x.size()[0]
-        x = F.relu(self.bn1(self.conv1(x))) # out shape: (B, 64, N)
-        x = F.relu(self.bn2(self.conv2(x))) # out shape: (B, 128, N)
-        x = F.relu(self.bn3(self.conv3(x))) # out shape: (B, 1024, N)
+        x = self.act1(self.conv1(x)) # out shape: (B, 64, N)
+        x = self.act2(self.conv2(x)) # out shape: (B, 128, N)
+        x = self.act3(self.conv3(x)) # out shape: (B, 1024, N)
         x = torch.max(x, 2, keepdim=True)[0] # max-pool across points dimension; out shape: (B, 1024, 1)
         x = x.view(-1, 1024) # out shape: (B, 1024)
 
-        x = F.relu(self.bn4(self.fc1(x))) # out shape: (B, 512)
-        x = F.relu(self.bn5(self.fc2(x))) # out shape: (B, 256)
+        x = self.act4(self.fc1(x)) # out shape: (B, 512)
+        x = self.act5(self.fc2(x)) # out shape: (B, 256)
         x = self.fc3(x) # out shape: (B, 9)
 
         iden = torch.autograd.Variable(torch.from_numpy(np.array([1,0,0,0,1,0,0,0,1]).astype(np.float32))).view(1,9).repeat(batchsize, 1)
@@ -1110,7 +1122,7 @@ class STN3d(nn.Module):
 
 class STNkd(nn.Module):
     """ Helper class for PointNetFeat. Predicts feature transformation matrices. """
-    def __init__(self, k=64):
+    def __init__(self, k=64, batch_norm=True):
         super(STNkd, self).__init__()
         self.conv1 = torch.nn.Conv1d(k, 64, 1)
         self.conv2 = torch.nn.Conv1d(64, 128, 1)
@@ -1119,25 +1131,37 @@ class STNkd(nn.Module):
         self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, k*k)
         self.relu = nn.ReLU() # TODO(VS) remove
+        self.batch_norm = batch_norm
 
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
-        self.bn4 = nn.BatchNorm1d(512)
-        self.bn5 = nn.BatchNorm1d(256)
+        self.act1 = lambda x: self.relu(x)
+        self.act2 = lambda x: self.relu(x)
+        self.act3 = lambda x: self.relu(x)
+        self.act4 = lambda x: self.relu(x)
+        self.act5 = lambda x: self.relu(x)
+        if self.batch_norm:
+            self.bn1 = nn.BatchNorm1d(64)
+            self.bn2 = nn.BatchNorm1d(128)
+            self.bn3 = nn.BatchNorm1d(1024)
+            self.bn4 = nn.BatchNorm1d(512)
+            self.bn5 = nn.BatchNorm1d(256)
+            self.act1 = lambda x: self.bn1(self.relu(x))
+            self.act2 = lambda x: self.bn2(self.relu(x))
+            self.act3 = lambda x: self.bn3(self.relu(x))
+            self.act4 = lambda x: self.bn4(self.relu(x))
+            self.act5 = lambda x: self.bn5(self.relu(x))
 
         self.k = k
 
     def forward(self, x):
         batchsize = x.size()[0]
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.act1(self.conv1(x))
+        x = self.act2(self.conv2(x))
+        x = self.act3(self.conv3(x))
         x = torch.max(x, 2, keepdim=True)[0]
         x = x.view(-1, 1024)
 
-        x = F.relu(self.bn4(self.fc1(x)))
-        x = F.relu(self.bn5(self.fc2(x)))
+        x = self.act4(self.fc1(x))
+        x = self.act5(self.fc2(x))
         x = self.fc3(x)
 
         iden = torch.nn.Variable(torch.from_numpy(np.eye(self.k).flatten().astype(np.float32))).view(1,self.k*self.k).repeat(batchsize,1)
@@ -1149,19 +1173,31 @@ class STNkd(nn.Module):
 
 class PointNetFeat(nn.Module):
     """ Helper class for PointNet. Predicts features from inputs. """
-    def __init__(self, global_feat_only=True, feature_transform=False):
+    def __init__(self, global_feat_only=True, feature_transform=False, batch_norm=True):
         super(PointNetFeat, self).__init__()
-        self.stn = STN3d() # input transformation class
         self.conv1 = torch.nn.Conv1d(3, 64, 1)
         self.conv2 = torch.nn.Conv1d(64, 128, 1)
         self.conv3 = torch.nn.Conv1d(128, 1024, 1)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.bn3 = nn.BatchNorm1d(1024)
+        self.relu = nn.ReLU()
+        self.batch_norm = batch_norm
+        self.stn = STN3d(batch_norm=self.batch_norm) # input transformation class
+
+        self.act1 = lambda x: self.relu(x)
+        self.act2 = lambda x: self.relu(x)
+        self.act3 = lambda x: x
+        if self.batch_norm:
+            self.bn1 = nn.BatchNorm1d(64)
+            self.bn2 = nn.BatchNorm1d(128)
+            self.bn3 = nn.BatchNorm1d(1024)
+            self.act1 = lambda x: self.bn1(self.relu(x))
+            self.act2 = lambda x: self.bn2(self.relu(x))
+            self.act3 = lambda x: self.bn3(x)
+
+
         self.global_feat = global_feat_only
         self.feature_transform = feature_transform
         if self.feature_transform:
-            self.fstn = STNkd(k=64) # feature transformation class
+            self.fstn = STNkd(k=64, batch_norm=self.batch_norm) # feature transformation class
 
     def forward(self, x):
         n_pts = x.size()[2]
@@ -1169,7 +1205,7 @@ class PointNetFeat(nn.Module):
         x = x.transpose(2, 1) # (B, 3, N) -> (B, N, 3)
         x = torch.bmm(x, trans) # (B, N, 3)
         x = x.transpose(2, 1) # after input transform; (B, N, 3) -> (B, 3, N)
-        x = F.relu(self.bn1(self.conv1(x))) # final feature shape (B, 64, N)
+        x = self.act1(self.conv1(x)) # final feature shape (B, 64, N)
 
         if self.feature_transform:
             trans_feat = self.fstn(x) # (B, 64, 64) feature transformation matrices
@@ -1180,8 +1216,8 @@ class PointNetFeat(nn.Module):
             trans_feat = None
 
         pointfeat = x # final feature shape (B, 64, N)
-        x = F.relu(self.bn2(self.conv2(x))) # out shape (B, 128, N)
-        x = self.bn3(self.conv3(x)) # out shape (B, 1024, N)
+        x = self.act2(self.conv2(x)) # out shape (B, 128, N)
+        x = self.act3(self.conv3(x)) # out shape (B, 1024, N)
         x = torch.max(x, 2, keepdim=True)[0] # max-pool across points dimension; shape (B, 1024, 1)
         x = x.view(-1, 1024) # shape (B, 1024)
         if self.global_feat:
@@ -1214,10 +1250,11 @@ class PointNetFeat(nn.Module):
 
 ## TODO(VS) refactor STN3d, STNkd, PointNetFeat, PointNetCore into a single PointNet class
 class PointCloudCore(EncoderCore):
-    def __init__(self, input_shape): #TODO(VS) add kwargs
+    def __init__(self, input_shape, batch_norm=True): #TODO(VS) add kwargs
         super(PointCloudCore, self).__init__(input_shape)
         self.input_shape = input_shape
-        self.pointnet = PointNetFeat(global_feat_only=True, feature_transform=False)
+        self.batch_norm = batch_norm
+        self.pointnet = PointNetFeat(global_feat_only=True, feature_transform=False, batch_norm=self.batch_norm)
 
     def output_shape(self, input_shape):
         return [1024]
