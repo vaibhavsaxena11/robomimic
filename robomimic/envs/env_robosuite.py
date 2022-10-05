@@ -204,15 +204,18 @@ class EnvRobosuite(EB.EnvBase):
             ret["eef_quat"] = np.array(di["eef_quat"])
             ret["gripper_qpos"] = np.array(di["gripper_qpos"])
 
-        # Adding 3D (x,y,z) points to observation dict.
+        # Adding depth and 3D (x,y,z) points to observation dict from each camera.
         #NOTE(VS)# obs keys are: any keys in ObsUtils.OBS_KEYS_TO_MODALITIES i.e. are images, object-state, and anything 
-        ## that comes from robot{i} (in that order) hence, agentview_depth is skipped 
+        ## that comes from robot{i} (in that order), hence agentview_depth is skipped until here, but included in the next block
         ## TODO(VS) cleanup comment
         for cam_name, cam_height, cam_width in zip(self.env.camera_names, self.env.camera_heights, self.env.camera_widths):
-            if f"{cam_name}_depth" in ret:
+            if f"{cam_name}_depth" in di:
+                if f"{cam_name}_depth" not in ret:
+                    ret[f"{cam_name}_depth"] = di[f"{cam_name}_depth"]
                 ret[f"{cam_name}_xyz"] = self.get_xyz_from_depth(ret[f"{cam_name}_depth"], cam_name, cam_height, cam_width)
                 if self.postprocess_visual_obs:
                     ret[f"{cam_name}_xyz"] = ObsUtils.process_obs(obs=ret[f"{cam_name}_xyz"], obs_modality='pcd')
+        #TODO(VS) maybe remove robot0_eye_in_hand_xyz and _depth from returned dict so as to reduce dataset size?
         return ret
 
     def get_real_depth_map(self, depth_map):
