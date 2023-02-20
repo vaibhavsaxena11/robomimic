@@ -911,16 +911,34 @@ class PointCloudModality(Modality):
         Returns:
             processed_obs (np.array or torch.Tensor): processed point cloud
         """
+        # Extract segmentation mask and point cloud from obs
+        if obs.shape[-1] == 4: # contains mask
+            mask = obs[..., -1]
+            obs = obs[..., :-1]
+        else: # if obs does not contain mask, set mask to ones
+            if torch.is_tensor(obs):
+                mask = torch.ones(list(obs.shape[:-1]))
+            else:
+                mask = np.ones(list(obs.shape[:-1]))
+
         assert obs.shape[-1] == 3, f"Point cloud data (xyz) should have last dimension 3, found {obs.shape[-1]}."
-        if len(obs.shape) == 4: # input with batch dimension
+        # Flatten point cloud and segmentation mask
+        if len(obs.shape) == 4: # input contains batch dimension
             pcd = obs.reshape([obs.shape[0], -1, 3]) # out shape: (B, H*W, 3)
+            mask = mask.reshape([mask.shape[0], -1, 1])
             if torch.is_tensor(pcd):
                 pcd = pcd.transpose(2, 1)
+                mask = mask.transpose(2, 1)
             else:
                 pcd = pcd.transpose([0, 2, 1])
+                mask = mask.transpose([0, 2, 1])
         else: # input without batch dimension
             pcd = obs.reshape([-1, 3]) # out shape: (H*W, 3)
+            mask = mask.reshape([-1, 1])
             pcd = pcd.transpose(1, 0)
+            mask = mask.transpose(1, 0)
+        # Apply segmentation mask
+        pcd = pcd * mask # + 10*(mask-1) ## shifting non-segmented regions to a fixed location (0,0,0)
         assert pcd.shape[-2] == 3 # test TODO(VS) put this in some unit test
         return pcd
 

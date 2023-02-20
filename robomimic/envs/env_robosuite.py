@@ -13,6 +13,7 @@ from robosuite.utils.mjcf_utils import postprocess_model_xml
 
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.envs.env_base as EB
+from robomimic.utils.geometry import get_xyz_from_depth
 
 
 class EnvRobosuite(EB.EnvBase):
@@ -150,6 +151,108 @@ class EnvRobosuite(EB.EnvBase):
             return self.get_observation()
         return None
 
+    ## NOTE(VS) code from https://github.com/ARISE-Initiative/robosuite/blob/master/robosuite/utils/mjcf_utils.py#L852
+    ## helper function to get instance ids from geom ids
+    ## TODO(VS) get this function away from here! This exists in robosuite's master but not in offline_study branch.
+    def get_ids(self, sim, elements, element_type="geom", inplace=False):
+        """
+        Grabs the mujoco IDs for each element in @elements, corresponding to the specified @element_type.
+        Args:
+            sim (MjSim): Active mujoco simulation object
+            elements (str or list or dict): Element(s) to convert into IDs. Note that the return type corresponds to
+                @elements type, where each element name is replaced with the ID
+            element_type (str): The type of element to grab ID for. Options are {geom, body, site}
+            inplace (bool): If False, will create a copy of @elements to prevent overwriting the original data structure
+        Returns:
+            str or list or dict: IDs corresponding to @elements.
+        """
+        from collections.abc import Iterable
+        if not inplace:
+            # Copy elements first so we don't write to the underlying object
+            elements = deepcopy(elements)
+        # Choose what to do based on elements type
+        if isinstance(elements, str):
+            # We simply return the value of this single element
+            assert element_type in {
+                "geom",
+                "body",
+                "site",
+            }, f"element_type must be either geom, body, or site. Got: {element_type}"
+            if element_type == "geom":
+                elements = sim.model.geom_name2id(elements)
+            elif element_type == "body":
+                elements = sim.model.body_name2id(elements)
+            else:  # site
+                elements = sim.model.site_name2id(elements)
+        elif isinstance(elements, dict):
+            # Iterate over each element in dict and recursively repeat
+            for name, ele in elements:
+                elements[name] = self.get_ids(sim=sim, elements=ele, element_type=element_type, inplace=True)
+        else:  # We assume this is an iterable array
+            assert isinstance(elements, Iterable), "Elements must be iterable for get_id!"
+            elements = [self.get_ids(sim=sim, elements=ele, element_type=element_type, inplace=True) for ele in elements]
+
+        return elements
+
+    ## NOTE(VS) code from https://github.com/ARISE-Initiative/robosuite/blob/master/robosuite/models/tasks/task.py#L91
+    ## TODO(VS) get this function away from here! This exists in robosuite's master but not in offline_study branch.
+    def generate_id_mappings(self, sim):
+        """
+        Generates IDs mapping class instances to set of (visual) geom IDs corresponding to that class instance
+        Args:
+            sim (MjSim): Current active mujoco simulation object
+        """
+        self._instances_to_ids = {}
+        self._geom_ids_to_instances = {}
+        self._site_ids_to_instances = {}
+        self._classes_to_ids = {}
+        self._geom_ids_to_classes = {}
+        self._site_ids_to_classes = {}
+
+        models = [model for model in self.env.model.mujoco_objects] ##
+        def _get_robot_models(robot):
+            models = [robot.mount] if robot.mount is not None else [] ## NOTE(VS) scraped from https://github.com/ARISE-Initiative/robosuite/blob/master/robosuite/models/robots/robot_model.py#L190
+            return models + list(robot.grippers.values()) ## NOTE(VS) scraped from https://github.com/ARISE-Initiative/robosuite/blob/master/robosuite/models/robots/manipulators/manipulator_model.py#L83
+        for robot in self.env.model.mujoco_robots: ##
+            # models += [robot] + robot.models ##
+            models += [robot] + _get_robot_models(robot) ##
+
+        # Parse all mujoco models from robots and objects
+        for model in models:
+            # Grab model class name and visual IDs
+            cls = str(type(model)).split("'")[1].split(".")[-1]
+            inst = model.name
+            id_groups = [
+                self.get_ids(sim=sim, elements=model.visual_geoms + model.contact_geoms, element_type="geom"),
+                self.get_ids(sim=sim, elements=model.sites, element_type="site"),
+            ]
+            group_types = ("geom", "site")
+            ids_to_instances = (self._geom_ids_to_instances, self._site_ids_to_instances)
+            ids_to_classes = (self._geom_ids_to_classes, self._site_ids_to_classes)
+
+            # Add entry to mapping dicts
+
+            # Instances should be unique
+            assert inst not in self._instances_to_ids, f"Instance {inst} already registered; should be unique"
+            self._instances_to_ids[inst] = {}
+
+            # Classes may not be unique
+            if cls not in self._classes_to_ids:
+                self._classes_to_ids[cls] = {group_type: [] for group_type in group_types}
+
+            for ids, group_type, ids_to_inst, ids_to_cls in zip(
+                id_groups, group_types, ids_to_instances, ids_to_classes
+            ):
+                # Add geom, site ids
+                self._instances_to_ids[inst][group_type] = ids
+                self._classes_to_ids[cls][group_type] += ids
+
+                # Add reverse mappings as well
+                for idn in ids:
+                    assert idn not in ids_to_inst, f"ID {idn} already registered; should be unique"
+                    ids_to_inst[idn] = inst
+                    ids_to_cls[idn] = cls
+
     def render(self, mode="human", height=None, width=None, camera_name="agentview"):
         """
         Render from simulation to either an on-screen window or off-screen to RGB array.
@@ -169,7 +272,10 @@ class EnvRobosuite(EB.EnvBase):
         else:
             raise NotImplementedError("mode={} is not implemented".format(mode))
 
-    def get_observation(self, di=None):
+    def get_observation(self, di=None, segmentation=True): 
+        ## TODO(VS) (needs fixing for rollout testing) when calling this during rollout, set segmentation= whatever was in the dataset 
+        ## currently, validation rollouts when dataset does not contain segmentation masks, will also segment out point clouds
+        ## this will still give out 3 channels, i.e. no error during training, but the policy is used to seeing full point cloud
         """
         Get current environment observation dictionary.
 
@@ -212,10 +318,62 @@ class EnvRobosuite(EB.EnvBase):
             if f"{cam_name}_depth" in di:
                 if f"{cam_name}_depth" not in ret:
                     ret[f"{cam_name}_depth"] = di[f"{cam_name}_depth"]
-                ret[f"{cam_name}_xyz"] = self.get_xyz_from_depth(ret[f"{cam_name}_depth"], cam_name, cam_height, cam_width)
-                if self.postprocess_visual_obs:
-                    ret[f"{cam_name}_xyz"] = ObsUtils.process_obs(obs=ret[f"{cam_name}_xyz"], obs_modality='pcd')
+                ret[f"{cam_name}_xyz"] = get_xyz_from_depth(
+                    self.get_real_depth_map(ret[f"{cam_name}_depth"]).squeeze(), 
+                    self.get_camera_intrinsic_matrix(cam_name, cam_height, cam_width), 
+                    cam_height, cam_width
+                )
+                # if self.postprocess_visual_obs:
+                #     ret[f"{cam_name}_xyz"] = ObsUtils.process_obs(obs=ret[f"{cam_name}_xyz"], obs_modality='pcd')
         #TODO(VS) maybe remove robot0_eye_in_hand_xyz and _depth from returned dict so as to reduce dataset size?
+        
+        if segmentation:
+            self.generate_id_mappings(self.env.sim)
+            ## NOTE(VS): most code from here: https://github.com/ARISE-Initiative/robosuite/blob/master/robosuite/environments/robot_env.py#L446
+            from robosuite.utils.mjcf_utils import IMAGE_CONVENTION_MAPPING
+            import robosuite.utils.macros as macros
+            convention = IMAGE_CONVENTION_MAPPING[macros.IMAGE_CONVENTION]
+            cam_s = "instance" # "class"
+            if cam_s == "instance":
+                name2id = {inst: i for i, inst in enumerate(list(self._instances_to_ids.keys()))} ##
+                mapping = {idn: name2id[inst] for idn, inst in self._geom_ids_to_instances.items()} ##
+                # print(name2id) # TODO(VS) cleanup
+                # print(mapping)
+            elif cam_s == "class":
+                name2id = {cls: i for i, cls in enumerate(list(self._classes_to_ids.keys()))}
+                mapping = {idn: name2id[cls] for idn, cls in self._geom_ids_to_classes.items()}
+            else:  # element
+                # No additional mapping needed
+                mapping = None
+                assert mapping is not None
+    
+            for cam_name, cam_height, cam_width in zip(self.env.camera_names, self.env.camera_heights, self.env.camera_widths):
+                seg = self.env.sim.render(
+                    camera_name=cam_name,
+                    width=cam_width,
+                    height=cam_height,
+                    depth=False,
+                    segmentation=True,
+                )
+                seg = np.expand_dims(seg[::convention, :, 1], axis=-1)
+                # Map raw IDs to grouped IDs if we're using instance or class-level segmentation
+                seg = (
+                    np.fromiter(map(lambda x: mapping.get(x, -1), seg.flatten()), dtype=np.int32).reshape(
+                        cam_height, cam_width, 1
+                    )
+                    + 1
+                ) # seg mask with 0 entry refers to points not belonging to any model (object or robot)
+                seg = (seg>0).astype(np.float)
+                # Concatenate seg mask as the last channel of point cloud
+                ret[f"{cam_name}_xyz"] = np.concatenate([ret[f"{cam_name}_xyz"], seg], -1)
+        else:
+            for cam_name, cam_height, cam_width in zip(self.env.camera_names, self.env.camera_heights, self.env.camera_widths):
+                ret[f"{cam_name}_xyz"] = np.concatenate([ret[f"{cam_name}_xyz"], np.ones([cam_height, cam_width, 1])], -1)
+            
+        if self.postprocess_visual_obs:
+            for cam_name in self.env.camera_names:
+                ret[f"{cam_name}_xyz"] = ObsUtils.process_obs(obs=ret[f"{cam_name}_xyz"], obs_modality='pcd')
+
         return ret
 
     def get_real_depth_map(self, depth_map):
@@ -250,34 +408,6 @@ class EnvRobosuite(EB.EnvBase):
         f = 0.5 * camera_height / np.tan(fovy * np.pi / 360)
         K = np.array([[f, 0, camera_width / 2], [0, f, camera_height / 2], [0, 0, 1]])
         return K
-
-    def get_xyz_from_depth(self, depth_map, camera_name, camera_height, camera_width):
-        """
-        TODO(VS) also add to camera_utils?
-        TODO(VS) doc string
-        TODO(VS) add unit tests
-
-        Converts uv-map (obtained using camera height and width) and depth-map to (x,y,z) coordinates
-        whose units are same as in the depth map.
-        Args:
-            camera_name (str)
-            camera_height (int)
-            camera_width (int)
-            depth_map (2x2 array): depth map (normalized returned by mujoco)
-        """
-        def parse_intrinsics(K):
-            fx = K[0, 0]
-            fy = K[1, 1]
-            cx = K[0, 2]
-            cy = K[1, 2]
-            return fx, fy, cx, cy
-        intrinsics = self.get_camera_intrinsic_matrix(camera_name, camera_height, camera_width)
-        depth_map = self.get_real_depth_map(depth_map).squeeze()
-        fx, fy, cx, cy = parse_intrinsics(intrinsics)
-        uv = np.mgrid[0:camera_width, 0:camera_height]
-        x = (uv[0] - cx) / fx * depth_map
-        y = (uv[1] - cy) / fy * depth_map
-        return np.stack((x, y, depth_map), axis=-1)
 
     def get_state(self):
         """
