@@ -157,6 +157,62 @@ class Squeeze(Module):
         return x.squeeze(dim=self.dim)
 
 
+class ResNetMLP(Module):
+    """
+    Basic ResNet block.
+
+    Forward returns the following:
+        output_activation ( model(input) + activation(layer_func(input)) )
+    """
+    def __init__(
+        self, 
+        model, 
+        input_dim,
+        output_dim, 
+        layer_func=nn.Linear,
+        layer_func_kwargs=None,
+        activation=nn.ReLU,
+        output_activation=None,
+    ):
+        """
+        Args:
+            input_dim (int): dimension of inputs
+
+            output_dim (int): dimension of outputs
+
+            layer_func: func for processing input (single layer) - defaults to Linear
+
+            layer_func_kwargs (dict): kwargs for @layer_func
+
+            activation: non-linearity after layer_func - defaults to ReLU
+
+            output_activation: if provided, applies the provided non-linearity after adding residual
+        """
+        super(ResNetMLP, self).__init__()
+        self.model = model
+        self._input_dim = input_dim
+        self._output_dim = output_dim
+
+        if layer_func_kwargs is None:
+            layer_func_kwargs = dict()
+
+        # single layer MLP for converting input to dim output_dim.
+        layers = [layer_func(input_dim, output_dim, **layer_func_kwargs)]
+        if activation is not None:
+            layers.append(activation())
+        self._model = nn.Sequential(*layers)
+        self.output_activation = output_activation
+
+    def output_shape(self, input_shape=None):
+        [self._output_dim]
+
+    def forward(self, inputs):
+        out =  self.model(inputs) + self._model(inputs)
+        if self.output_activation is not None:
+            out = self.output_activation(out)
+        return out
+
+
 class MLP(Module):
     """
     Base class for simple Multi-Layer Perceptrons.
@@ -172,6 +228,7 @@ class MLP(Module):
         dropouts=None,
         normalization=False,
         output_activation=None,
+        residual=False,
     ):
         """
         Args:
@@ -210,6 +267,9 @@ class MLP(Module):
                 layers.append(nn.Dropout(dropouts[i]))
             dim = l
         layers.append(layer_func(dim, output_dim))
+        if residual:
+            model = nn.Sequential(*layers)
+            layers = [ResNetMLP(model, input_dim, output_dim, layer_func=layer_func, layer_func_kwargs=layer_func_kwargs, activation=activation, output_activation=None)]
         if output_activation is not None:
             layers.append(output_activation())
         self._layer_func = layer_func
@@ -493,6 +553,61 @@ class ResNet18Conv(ConvBase):
         out_h = int(math.ceil(input_shape[1] / 32.))
         out_w = int(math.ceil(input_shape[2] / 32.))
         return [512, out_h, out_w]
+
+    def __repr__(self):
+        """Pretty print network."""
+        header = '{}'.format(str(self.__class__.__name__))
+        return header + '(input_channel={}, input_coord_conv={})'.format(self._input_channel, self._input_coord_conv)
+
+
+class ResNet50Conv(ConvBase):
+    """
+    A ResNet50 block that can be used to process input images.
+    """
+    def __init__(
+        self,
+        input_channel=3,
+        pretrained=False,
+        input_coord_conv=False,
+    ):
+        """
+        Args:
+            input_channel (int): number of input channels for input images to the network.
+                If not equal to 3, modifies first conv layer in ResNet to handle the number
+                of input channels.
+            pretrained (bool): if True, load pretrained weights for all ResNet layers.
+            input_coord_conv (bool): if True, use a coordinate convolution for the first layer
+                (a convolution where input channels are modified to encode spatial pixel location)
+        """
+        super(ResNet50Conv, self).__init__()
+        net = vision_models.resnet50(pretrained=pretrained)
+
+        if input_coord_conv:
+            net.conv1 = CoordConv2d(input_channel, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        elif input_channel != 3:
+            net.conv1 = nn.Conv2d(input_channel, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
+        # cut the last fc layer
+        self._input_coord_conv = input_coord_conv
+        self._input_channel = input_channel
+        self.nets = torch.nn.Sequential(*(list(net.children())[:-2]))
+
+    def output_shape(self, input_shape):
+        """
+        Function to compute output shape from inputs to this module. 
+
+        Args:
+            input_shape (iterable of int): shape of input. Does not include batch dimension.
+                Some modules may not need this argument, if their output does not depend 
+                on the size of the input, or if they assume fixed size input.
+
+        Returns:
+            out_shape ([int]): list of integers corresponding to output shape
+        """
+        assert(len(input_shape) == 3)
+        out_h = int(math.ceil(input_shape[1] / 32.))
+        out_w = int(math.ceil(input_shape[2] / 32.))
+        return [2048, out_h, out_w]
 
     def __repr__(self):
         """Pretty print network."""
@@ -1114,8 +1229,7 @@ class STN3d(nn.Module):
         x = self.fc3(x) # out shape: (B, 9)
 
         iden = torch.autograd.Variable(torch.from_numpy(np.array([1,0,0,0,1,0,0,0,1]).astype(np.float32))).view(1,9).repeat(batchsize, 1)
-        if x.is_cuda:
-            iden = iden.cuda()
+        iden = iden.to(x.device)
         x = x + iden
         x = x.view(-1, 3, 3)
         return x
@@ -1167,8 +1281,7 @@ class STNkd(nn.Module):
         x = self.fc3(x)
 
         iden = torch.nn.Variable(torch.from_numpy(np.eye(self.k).flatten().astype(np.float32))).view(1,self.k*self.k).repeat(batchsize,1)
-        if x.is_cuda:
-            iden = iden.cuda()
+        iden = iden.to(x.device)
         x = x + iden
         x = x.view(-1, self.k, self.k)
         return x
@@ -1205,7 +1318,7 @@ class PointNetFeat(nn.Module):
             self.fstn = STNkd(k=64, batch_norm=self.batch_norm, channel_multiplier=self.channel_multiplier) # feature transformation class
 
     def forward(self, x):
-        n_pts = x.size()[2]
+        n_pts = x.size()[2] # input shape (B, 3, n_pts)
         trans = self.stn(x) # (B, 3, 3) input transformation matrices
         x = x.transpose(2, 1) # (B, 3, N) -> (B, N, 3)
         x = torch.bmm(x, trans) # (B, N, 3)
@@ -1276,6 +1389,32 @@ class PointCloudCore(EncoderCore):
     ## TODO(VS)
     # def __repr__(self):
     #     raise NotImplementedError
+
+
+import robomimic.ndf_robot.src.ndf_robot.model as ndf_model
+class ResnetPointnetCore(EncoderCore):
+    ''' DGCNN-based VNN encoder network with ResNet blocks.
+
+    Args:
+        c_dim (int): dimension of latent code c
+        dim (int): input points dimension
+        hidden_dim (int): hidden dimension of the network
+    '''
+
+    def __init__(self, input_shape, c_dim=128, dim=3, hidden_dim=128, k=20, meta_output=None):
+        super().__init__(input_shape)
+        self._input_shape = input_shape
+        self.c_dim = c_dim
+        self.pointnet = ndf_model.VNN_ResnetPointnet(c_dim=c_dim, dim=dim, hidden_dim=hidden_dim, k=k, meta_output=meta_output)
+        
+    def output_shape(self, input_shape):
+        return [self.c_dim*3]
+
+    def forward(self, inputs):
+        output = self.pointnet(inputs)
+        batch_size = output.shape[0]
+        return output.reshape([batch_size, -1])
+
 
 """
 ================================================
