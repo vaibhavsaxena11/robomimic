@@ -8,6 +8,7 @@ tanh activation to help ensure this range.
 """
 import textwrap
 import numpy as np
+import copy
 from collections import OrderedDict
 
 import torch
@@ -16,7 +17,8 @@ import torch.nn.functional as F
 import torch.distributions as D
 
 import robomimic.utils.tensor_utils as TensorUtils
-from robomimic.models.base_nets import Module
+import robomimic.utils.obs_utils as ObsUtils
+from robomimic.models.base_nets import Module, MLP
 from robomimic.models.obs_nets import MIMO_MLP, RNN_MIMO_MLP
 from robomimic.models.vae_nets import VAE
 from robomimic.models.distributions import TanhWrappedDistribution
@@ -108,6 +110,282 @@ class ActorNetwork(MIMO_MLP):
     def _to_string(self):
         """Info to pretty print."""
         return "action_dim={}".format(self.ac_dim)
+
+
+class AffordanceNetworkLite(Module):
+    def __init__(
+            self,
+            obs_shapes,
+            feat_dim, # not used because no MLP here except affordance
+            ac_implicit_dim, # action to predict affordance of 
+            ac_explicit_dim, # action to predict directly # TODO(VS) set this to None by default and handle it in the class
+            mlp_layer_dims,
+            affordance_layer_dims,
+            layer_func=nn.Linear,
+            activation=nn.ReLU,
+            # pad_images=False,
+            goal_shapes=None,
+            encoder_kwargs=None,
+        ):
+        super(AffordanceNetworkLite, self).__init__()
+
+        assert isinstance(obs_shapes, OrderedDict)
+        self.obs_shapes = obs_shapes
+        # self.feat_dim = feat_dim
+        self.ac_implicit_dim = ac_implicit_dim
+        self.ac_explicit_dim = ac_explicit_dim
+        self.nets = nn.ModuleDict()
+
+        #TODO(VS) handle goals, other input modalities
+
+        # ### compute padding
+        # self.pad_images = pad_images
+        # self.padding = OrderedDict()
+        # if pad_images:
+        #     self.obs_shapes = copy.copy(self.obs_shapes)
+        #     # computing padding for all input images
+        #     for k in self.obs_shapes:
+        #         if k in ObsUtils.OBS_MODALITIES_TO_KEYS["rgb"]:
+        #             in_shape = self.obs_shapes[k] # (C, H, W)
+        #             self.padding[k] = np.zeros((len(in_shape), 2), dtype=int)
+        #             max_dim = max(in_shape[-2:])
+        #             pad = (max_dim - np.array(in_shape[-2:])) / 2
+        #             self.padding[k][-2:] = pad.reshape(2, 1)
+        #             # updating obs_shape
+        #             self.obs_shapes[k] += np.sum(self.padding[k], axis=1)
+        #             self.padding[k] = tuple(np.flip(self.padding[k], 0).flatten()) # flattening to tuple (pad_N_left, pad_N_right, pad_N-1_left, pad_N-1_right, ...)
+        # ###
+        
+        backbone_cls = eval(encoder_kwargs["rgb"]["core_kwargs"]["backbone_class"])
+        self.backbone = backbone_cls(**encoder_kwargs["rgb"]["core_kwargs"]["backbone_kwargs"]) # TODO(VS) link config params more generally
+        self.feat_dim = np.prod(self.backbone.output_shape(self.obs_shapes[list(self.obs_shapes.keys())[0]])) # TODO(VS) assuming "color_*" is the only key
+        net_list = [self.backbone]
+        # flatten output of ResNet.
+        net_list.append(nn.Flatten(start_dim=1, end_dim=-1))
+        # net_list.append(
+        #     nn.Linear(self.feat_dim, 100+self.ac_explicit_dim) # from VisualCore
+        # )
+        net_list.append(
+            MLP(
+                input_dim=self.feat_dim,
+                output_dim=100+self.ac_explicit_dim,
+                layer_dims=[1024, 1024],
+                layer_func=layer_func,
+                activation=nn.ReLU,
+                output_activation=nn.ReLU
+            )
+        )
+        # net_list.append(
+        #     MLP( # from MIMO_MLP's mlp
+        #         input_dim=64,
+        #         output_dim=1024,
+        #         layer_dims=[1024,],
+        #         layer_func=layer_func,
+        #         output_activation=nn.ReLU ## nn.Tanh (did not work with tanh)
+        #     )
+        # )
+        # net_list.append(
+        #     nn.Linear(1024, 100+self.ac_explicit_dim) # from MIMO_MLP's decoder
+        # )
+        self.nets["encoder"] = nn.Sequential(*net_list)
+        # self.nets["act_explicit"] = MLP(
+        #     input_dim=100,
+        #     output_dim=self.ac_explicit_dim,
+        #     layer_dims=affordance_layer_dims[:-1],
+        #     layer_func=layer_func,
+        #     # activation=activation,
+        #     output_activation=nn.Sigmoid,#nn.Tanh,
+        # )
+        # define MLP for affordance prediction.
+        self.nets["affordance"] = MLP(
+            input_dim=100+ac_implicit_dim,
+            output_dim=affordance_layer_dims[-1],
+            layer_dims=affordance_layer_dims[:-1],
+            layer_func=layer_func,
+            # activation=activation,
+            output_activation=activation,
+            residual=True,
+        )
+        
+        # ################################################################
+        # ######## Arch fully resembling ResNet18+MIMO_MLP ########
+        # self.backbone = ResNet18Conv(**encoder_kwargs["rgb"]["core_kwargs"]["backbone_kwargs"]) # TODO(VS) link config params more generally
+        # self.feat_dim = np.prod(self.backbone.output_shape(obs_shapes[list(obs_shapes.keys())[0]])) # TODO(VS) assuming "color_*" is the only key
+        # net_list = [self.backbone]
+        # # flatten output of ResNet.
+        # net_list.append(nn.Flatten(start_dim=1, end_dim=-1))
+        # net_list.append(
+        #     nn.Linear(self.feat_dim, 64) # from VisualCore
+        # )
+        # net_list.append(
+        #     MLP( # from MIMO_MLP's mlp
+        #         input_dim=64,
+        #         output_dim=1024,
+        #         layer_dims=[1024,],
+        #         layer_func=layer_func,
+        #         output_activation=nn.ReLU ## nn.Tanh (did not work with tanh)
+        #     )
+        # )
+        # net_list.append(
+        #     nn.Linear(1024, 100+self.ac_explicit_dim) # from MIMO_MLP's decoder
+        # )
+        # self.nets["encoder"] = nn.Sequential(*net_list)
+        # self.nets["affordance"] = MLP(
+        #     input_dim=100+ac_implicit_dim,
+        #     output_dim=affordance_layer_dims[-1],
+        #     layer_dims=affordance_layer_dims[:-1],
+        #     layer_func=layer_func,
+        #     # activation=activation,
+        #     output_activation=activation,
+        # )
+        # ################################################################
+
+    def output_shape(self, input_shape=None):
+        return [self.feat_dim+self.ac_explicit_dim]
+
+    def forward(self, obs_dict, action, goal_dict=None):
+        # ### padding all images
+        # if self.pad_images:
+        #     obs_dict = copy.copy(obs_dict)
+        #     for k in obs_dict:
+        #         if k in ObsUtils.OBS_MODALITIES_TO_KEYS["rgb"]:
+        #             obs_dict[k] = F.pad(obs_dict[k], self.padding[k], mode='constant')
+        # ###
+        # import pdb; pdb.set_trace()
+
+        out = self.nets["encoder"](obs_dict[list(obs_dict.keys())[0]]) # assuming only one key (a color image)
+        if self.ac_explicit_dim is not None:
+            act_exp = out[..., :self.ac_explicit_dim] # orientation prediction from the MIMO_MLP
+            feats = out[..., self.ac_explicit_dim:] # remaining are features from ResNet
+        else:
+            act_exp = None
+            feats = out
+        # Computing action affordance.
+        if len(action.shape) == len(feats.shape):
+            act_aff = self.nets["affordance"].forward(torch.cat([feats, action], -1)) # translation affordance
+            # act_feats = self.nets["action_encoder"].forward(action)
+            # act_aff = self.nets["affordance"].forward(torch.cat([feats, act_feats], -1)) # translation affordance
+        else: # extra dim in action, across which to broadcast feats
+            assert len(action.shape) == 3, action.shape
+            feats = torch.tile(torch.unsqueeze(feats, 1), [1, action.shape[1], 1]) # shape (B, num_wrong_actions, self.ac_dim)
+            act_aff = self.nets["affordance"].forward(torch.cat([feats, action], -1)) # shape (B, num_wrong_actions, 1)
+            # act_feats = self.nets["action_encoder"].forward(action)
+            # act_aff = self.nets["affordance"].forward(torch.cat([feats, act_feats], -1)) # shape (B, num_wrong_actions, 1)
+        return act_aff, act_exp
+
+    def _to_string(self):
+        """Info to pretty print."""
+        return "feats_dim={}".format(self.output_shape)
+
+
+class AffordanceNetwork(MIMO_MLP):
+    def __init__(
+            self,
+            obs_shapes,
+            feat_dim,
+            ac_implicit_dim, # action to predict affordance of 
+            ac_explicit_dim, # action to predict directly # TODO(VS) set this to None by default and handle it in the class
+            mlp_layer_dims,
+            affordance_layer_dims,
+            layer_func=nn.Linear,
+            activation=nn.ReLU,
+            goal_shapes=None,
+            encoder_kwargs=None,
+        ):
+        assert isinstance(obs_shapes, OrderedDict)
+        self.obs_shapes = obs_shapes
+        self.feat_dim = feat_dim
+        self.ac_implicit_dim = ac_implicit_dim
+        self.ac_explicit_dim = ac_explicit_dim
+
+        # set up different observation groups for @MIMO_MLP
+        observation_group_shapes = OrderedDict()
+        observation_group_shapes["obs"] = OrderedDict(self.obs_shapes)
+
+        self._is_goal_conditioned = False
+        if goal_shapes is not None and len(goal_shapes) > 0:
+            assert isinstance(goal_shapes, OrderedDict)
+            self._is_goal_conditioned = True
+            self.goal_shapes = OrderedDict(goal_shapes)
+            observation_group_shapes["goal"] = OrderedDict(self.goal_shapes)
+        else:
+            self.goal_shapes = OrderedDict()
+
+        output_shapes = self._get_output_shapes()
+        super(AffordanceNetwork, self).__init__(
+            input_obs_group_shapes=observation_group_shapes,
+            output_shapes=output_shapes,
+            layer_dims=mlp_layer_dims,
+            encoder_kwargs=encoder_kwargs,
+        )
+
+        # act_enc_dims = 10
+        # self.nets["action_encoder"] = MLP(
+        #     input_dim=ac_implicit_dim,
+        #     output_dim=act_enc_dims,
+        #     layer_dims=[20, 20],
+        #     layer_func=layer_func,
+        #     output_activation=nn.ReLU,#activation,
+        # )
+
+        # self.nets["affordance"] = MLP(
+        #     input_dim=feat_dim+act_enc_dims,
+        #     output_dim=affordance_layer_dims[-1],
+        #     layer_dims=affordance_layer_dims[:-1],
+        #     layer_func=layer_func,
+        #     # activation=activation,
+        #     output_activation=activation,
+        # )
+
+        self.nets["affordance"] = MLP(
+            input_dim=feat_dim+ac_implicit_dim,
+            output_dim=affordance_layer_dims[-1],
+            layer_dims=affordance_layer_dims[:-1],
+            layer_func=layer_func,
+            # activation=activation,
+            output_activation=activation,
+        )
+        import pdb; pdb.set_trace()
+
+
+    def _get_output_shapes(self):
+        """
+        Allow subclasses to re-define outputs from @MIMO_MLP, since we won't
+        always directly predict actions, but may instead predict the parameters
+        of a action distribution.
+        """
+        # return OrderedDict(action=(self.feat_dim,))
+
+        # return OrderedDict(feats=(self.feat_dim,), ac_explicit=(self.ac_explicit_dim,))
+        return OrderedDict(act_feats=(self.feat_dim+self.ac_explicit_dim,))
+
+    def output_shape(self, input_shape=None): # TODO(VS) check if this is what it should be
+        return [self.feat_dim]
+
+    def forward(self, obs_dict, action, goal_dict=None):
+        out = super(AffordanceNetwork, self).forward(obs=obs_dict, goal=goal_dict)["act_feats"]
+        if self.ac_explicit_dim is not None:
+            act_exp = out[..., :self.ac_explicit_dim] # orientation prediction from the MIMO_MLP
+            feats = out[..., self.ac_explicit_dim:] # remaining are features from ResNet
+        else:
+            act_exp = None
+            feats = out
+        # Computing action affordance.
+        if len(action.shape) == len(feats.shape):
+            act_aff = self.nets["affordance"].forward(torch.cat([feats, action], -1)) # translation affordance
+            # act_feats = self.nets["action_encoder"].forward(action)
+            # act_aff = self.nets["affordance"].forward(torch.cat([feats, act_feats], -1)) # translation affordance
+        else: # extra dim in action, across which to broadcast feats
+            assert len(action.shape) == 3, action.shape
+            feats = torch.tile(torch.unsqueeze(feats, 1), [1, action.shape[1], 1]) # shape (B, num_wrong_actions, self.ac_dim)
+            act_aff = self.nets["affordance"].forward(torch.cat([feats, action], -1)) # shape (B, num_wrong_actions, 1)
+            # act_feats = self.nets["action_encoder"].forward(action)
+            # act_aff = self.nets["affordance"].forward(torch.cat([feats, act_feats], -1)) # shape (B, num_wrong_actions, 1)
+        return act_aff, act_exp
+
+    def _to_string(self):
+        """Info to pretty print."""
+        return "feats_dim={}".format(self.feat_dim)
 
 
 class PerturbationActorNetwork(ActorNetwork):
