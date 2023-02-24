@@ -43,6 +43,7 @@ class EnvRavens(EB.EnvBase):
         # Take a step in the environment with an input action, return (observation, reward, done, info).
         act = {"pose0": (action[:3], action[3:7]), "pose1":(action[7:10], action[10:14])}
         obs, reward, done, info = self.env.step(act)
+        self.total_reward += reward
         cmap, hmap, mask = self.task.get_true_image(self.env)
         obs['color'] = (*obs['color'], cmap)
         obs['depth'] = (*obs['depth'], hmap)
@@ -125,12 +126,13 @@ class EnvRavens(EB.EnvBase):
         { str: bool } with at least a "task" key for the overall task success,
         and additional optional keys corresponding to other task criteria.
         """
-        if self.total_reward > 0.99:
-            return { "task" : True }
-        return { "task" : False }
+        # if self.total_reward > 0.99:
+        #     return { "task" : True }
+        # return { "task" : False }
+        return { "task" : self.task.done() }
 
     def is_done(self):
-        pass
+        return self.task.done() # task returns done=true when success
 
     def get_reward(self):
         pass
