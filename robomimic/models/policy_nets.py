@@ -18,7 +18,7 @@ import torch.distributions as D
 
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.obs_utils as ObsUtils
-from robomimic.models.base_nets import Module, MLP
+from robomimic.models.base_nets import Module, MLP, ResNet18Conv, ResNet50Conv, UNetConv
 from robomimic.models.obs_nets import MIMO_MLP, RNN_MIMO_MLP
 from robomimic.models.vae_nets import VAE
 from robomimic.models.distributions import TanhWrappedDistribution
@@ -112,6 +112,87 @@ class ActorNetwork(MIMO_MLP):
         return "action_dim={}".format(self.ac_dim)
 
 
+class EncoderForAffordance(Module):
+    def __init__(
+        self,
+        obs_shapes,
+        encoder_kwargs,
+        layer_func=nn.Linear,
+        recon_enabled=False,
+        feat_stop_grad=False
+    ):
+        super(EncoderForAffordance, self).__init__()
+
+        self.obs_shapes = obs_shapes
+        self.recon_enabled = recon_enabled
+        self.feat_stop_grad = feat_stop_grad
+        # self.nets = nn.ModuleDict()
+        self.backbone_name = encoder_kwargs["rgb"]["core_kwargs"]["backbone_class"]
+        self._recon_capable_backbones = ["UNetConv"] # TODO(VS) get this from base_nets
+
+        if self.recon_enabled:
+            # backbone class should be capable of outputing dict containing keys "feats" and "recon"
+            assert self.backbone_name in self._recon_capable_backbones
+
+        backbone_cls = eval(self.backbone_name)
+        if self.backbone_name in self._recon_capable_backbones:
+            # informing the backbone if recon is enabled.
+            self.backbone = backbone_cls(recon_enabled=self.recon_enabled, **encoder_kwargs["rgb"]["core_kwargs"]["backbone_kwargs"]) # TODO(VS) link config params more generally
+        else:
+            self.backbone = backbone_cls(**encoder_kwargs["rgb"]["core_kwargs"]["backbone_kwargs"]) # TODO(VS) link config params more generally
+        self.conv_feat_dim = np.prod(self.backbone.output_shape(self.obs_shapes[list(self.obs_shapes.keys())[0]])) # TODO(VS) assuming "color_*" is the only key
+
+        # net_list = [self.backbone]
+
+        self.net_list = nn.ModuleList()
+        # flatten output of Conv net.
+        self.net_list.append(nn.Flatten(start_dim=1, end_dim=-1))
+        # net_list.append(
+        #     nn.Linear(self.conv_feat_dim, 100+self.ac_explicit_dim) # from VisualCore
+        # )
+        #TODO(VS) set the output dim and hidden layer dims of the following MLP using config
+        self.net_list.append(
+            MLP(
+                input_dim=self.conv_feat_dim,
+                output_dim=100,#+self.ac_explicit_dim, #TODO(VS) compare this to MLP encoding in CWVAE after DCGAN conv layers
+                layer_dims=[1024, 1024],
+                layer_func=layer_func,
+                activation=nn.ReLU,
+                output_activation=nn.ReLU
+            )
+        )
+        # self.nets["encoder"] = nn.Sequential(*net_list)
+
+    def output_shape(self, input_shape=None):
+        return [self.conv_feat_dim]
+
+    def forward(self, input):
+        """
+        Returns:
+            conv features, input reconstruction
+        """
+        out_backbone = self.backbone(input)
+        if self.backbone_name in self._recon_capable_backbones:
+            out = out_backbone["feats"].detach() if self.feat_stop_grad else out_backbone["feats"]
+        else:
+            out = out_backbone
+
+        for net in self.net_list:
+            out = net(out)
+
+        if self.backbone_name in self._recon_capable_backbones:
+            return out, out_backbone["recon"]
+        else:
+            return out, None
+
+    @property
+    def num_weights(self):
+        count = 0
+        for p in self.parameters():
+            count += torch.prod(torch.tensor(p.shape))
+        return count
+
+
 class AffordanceNetworkLite(Module):
     def __init__(
             self,
@@ -123,8 +204,8 @@ class AffordanceNetworkLite(Module):
             affordance_layer_dims,
             layer_func=nn.Linear,
             activation=nn.ReLU,
-            # pad_images=False,
             goal_shapes=None,
+            shared_encoder=None,
             encoder_kwargs=None,
         ):
         super(AffordanceNetworkLite, self).__init__()
@@ -134,68 +215,50 @@ class AffordanceNetworkLite(Module):
         # self.feat_dim = feat_dim
         self.ac_implicit_dim = ac_implicit_dim
         self.ac_explicit_dim = ac_explicit_dim
+        self.shared_encoder = shared_encoder is not None
         self.nets = nn.ModuleDict()
+        self.shared_nets = nn.ModuleDict()
 
         #TODO(VS) handle goals, other input modalities
-
-        # ### compute padding
-        # self.pad_images = pad_images
-        # self.padding = OrderedDict()
-        # if pad_images:
-        #     self.obs_shapes = copy.copy(self.obs_shapes)
-        #     # computing padding for all input images
-        #     for k in self.obs_shapes:
-        #         if k in ObsUtils.OBS_MODALITIES_TO_KEYS["rgb"]:
-        #             in_shape = self.obs_shapes[k] # (C, H, W)
-        #             self.padding[k] = np.zeros((len(in_shape), 2), dtype=int)
-        #             max_dim = max(in_shape[-2:])
-        #             pad = (max_dim - np.array(in_shape[-2:])) / 2
-        #             self.padding[k][-2:] = pad.reshape(2, 1)
-        #             # updating obs_shape
-        #             self.obs_shapes[k] += np.sum(self.padding[k], axis=1)
-        #             self.padding[k] = tuple(np.flip(self.padding[k], 0).flatten()) # flattening to tuple (pad_N_left, pad_N_right, pad_N-1_left, pad_N-1_right, ...)
-        # ###
         
-        backbone_cls = eval(encoder_kwargs["rgb"]["core_kwargs"]["backbone_class"])
-        self.backbone = backbone_cls(**encoder_kwargs["rgb"]["core_kwargs"]["backbone_kwargs"]) # TODO(VS) link config params more generally
-        self.feat_dim = np.prod(self.backbone.output_shape(self.obs_shapes[list(self.obs_shapes.keys())[0]])) # TODO(VS) assuming "color_*" is the only key
-        net_list = [self.backbone]
-        # flatten output of ResNet.
-        net_list.append(nn.Flatten(start_dim=1, end_dim=-1))
-        # net_list.append(
-        #     nn.Linear(self.feat_dim, 100+self.ac_explicit_dim) # from VisualCore
-        # )
-        net_list.append(
-            MLP(
-                input_dim=self.feat_dim,
-                output_dim=100+self.ac_explicit_dim,
-                layer_dims=[1024, 1024],
+        if shared_encoder is None:
+            # backbone_cls = eval(encoder_kwargs["rgb"]["core_kwargs"]["backbone_class"])
+            # self._backbone = backbone_cls(**encoder_kwargs["rgb"]["core_kwargs"]["backbone_kwargs"]) # TODO(VS) link config params more generally
+            # self.feat_dim = np.prod(self._backbone.output_shape(self.obs_shapes[list(self.obs_shapes.keys())[0]])) # TODO(VS) assuming "color_*" is the only key
+            # net_list = [self._backbone]
+            # # flatten output of ResNet.
+            # net_list.append(nn.Flatten(start_dim=1, end_dim=-1))
+            # # net_list.append(
+            # #     nn.Linear(self.feat_dim, 100+self.ac_explicit_dim) # from VisualCore
+            # # )
+            # net_list.append(
+            #     MLP(
+            #         input_dim=self.feat_dim,
+            #         output_dim=100,#+self.ac_explicit_dim, #TODO(VS) compare this to MLP encoding in CWVAE after DCGAN conv layers
+            #         layer_dims=[1024, 1024],
+            #         layer_func=layer_func,
+            #         activation=nn.ReLU,
+            #         output_activation=nn.ReLU
+            #     )
+            # )
+            # self.nets["encoder"] = nn.Sequential(*net_list)
+
+            self.nets["encoder"] = EncoderForAffordance(obs_shapes=self.obs_shapes, encoder_kwargs=encoder_kwargs)
+            self.encoder = self.nets["encoder"]
+        else:
+            self.shared_nets["encoder"] = shared_encoder
+            self.encoder = self.shared_nets["encoder"]
+
+        if self.ac_explicit_dim is not None:
+            self.nets["act_explicit"] = MLP(
+                input_dim=100,
+                output_dim=self.ac_explicit_dim,
+                layer_dims=[50, 50],
                 layer_func=layer_func,
                 activation=nn.ReLU,
-                output_activation=nn.ReLU
+                output_activation=nn.ReLU, # nn.Sigmoid, # nn.Tanh,
             )
-        )
-        # net_list.append(
-        #     MLP( # from MIMO_MLP's mlp
-        #         input_dim=64,
-        #         output_dim=1024,
-        #         layer_dims=[1024,],
-        #         layer_func=layer_func,
-        #         output_activation=nn.ReLU ## nn.Tanh (did not work with tanh)
-        #     )
-        # )
-        # net_list.append(
-        #     nn.Linear(1024, 100+self.ac_explicit_dim) # from MIMO_MLP's decoder
-        # )
-        self.nets["encoder"] = nn.Sequential(*net_list)
-        # self.nets["act_explicit"] = MLP(
-        #     input_dim=100,
-        #     output_dim=self.ac_explicit_dim,
-        #     layer_dims=affordance_layer_dims[:-1],
-        #     layer_func=layer_func,
-        #     # activation=activation,
-        #     output_activation=nn.Sigmoid,#nn.Tanh,
-        # )
+
         # define MLP for affordance prediction.
         self.nets["affordance"] = MLP(
             input_dim=100+ac_implicit_dim,
@@ -241,37 +304,42 @@ class AffordanceNetworkLite(Module):
         # ################################################################
 
     def output_shape(self, input_shape=None):
-        return [self.feat_dim+self.ac_explicit_dim]
+        ## not useful anyway ##
+        # return [self.feat_dim+self.ac_explicit_dim]
+        return [self.feat_dim]
 
-    def forward(self, obs_dict, action, goal_dict=None):
-        # ### padding all images
-        # if self.pad_images:
-        #     obs_dict = copy.copy(obs_dict)
-        #     for k in obs_dict:
-        #         if k in ObsUtils.OBS_MODALITIES_TO_KEYS["rgb"]:
-        #             obs_dict[k] = F.pad(obs_dict[k], self.padding[k], mode='constant')
-        # ###
-        # import pdb; pdb.set_trace()
-
-        out = self.nets["encoder"](obs_dict[list(obs_dict.keys())[0]]) # assuming only one key (a color image)
+    def forward(self, obs_dict, action, goal_dict=None, enc_outputs=None):
+        if enc_outputs is None:
+            feats, recon = self.encoder(obs_dict[list(obs_dict.keys())[0]]) # assuming only one key (a color image)
+            enc_outputs = {"feats": feats, "recon": recon}
+        else:
+            feats = enc_outputs["feats"]
+            recon = enc_outputs["recon"]
+        
         if self.ac_explicit_dim is not None:
-            act_exp = out[..., :self.ac_explicit_dim] # orientation prediction from the MIMO_MLP
-            feats = out[..., self.ac_explicit_dim:] # remaining are features from ResNet
+            # act_exp = embed[..., :self.ac_explicit_dim] # orientation prediction
+            # feats = embed[..., self.ac_explicit_dim:] # remaining are features from ResNet
+            act_exp = self.nets["act_explicit"](feats) # orientation prediction
         else:
             act_exp = None
-            feats = out
         # Computing action affordance.
         if len(action.shape) == len(feats.shape):
             act_aff = self.nets["affordance"].forward(torch.cat([feats, action], -1)) # translation affordance
-            # act_feats = self.nets["action_encoder"].forward(action)
-            # act_aff = self.nets["affordance"].forward(torch.cat([feats, act_feats], -1)) # translation affordance
         else: # extra dim in action, across which to broadcast feats
             assert len(action.shape) == 3, action.shape
-            feats = torch.tile(torch.unsqueeze(feats, 1), [1, action.shape[1], 1]) # shape (B, num_wrong_actions, self.ac_dim)
-            act_aff = self.nets["affordance"].forward(torch.cat([feats, action], -1)) # shape (B, num_wrong_actions, 1)
-            # act_feats = self.nets["action_encoder"].forward(action)
-            # act_aff = self.nets["affordance"].forward(torch.cat([feats, act_feats], -1)) # shape (B, num_wrong_actions, 1)
-        return act_aff, act_exp
+            feats_ = torch.tile(torch.unsqueeze(feats, 1), [1, action.shape[1], 1]) # (B, num_wrong_actions, self.ac_dim)
+            act_aff = self.nets["affordance"].forward(torch.cat([feats_, action], -1)) # (B, num_wrong_actions, 1)
+        return act_aff, act_exp, enc_outputs
+
+    def parameters(self, recurse=True):
+        return self.nets.parameters(recurse)
+
+    @property
+    def num_weights(self):
+        count = 0
+        for p in self.parameters():
+            count += torch.prod(torch.tensor(p.shape))
+        return count
 
     def _to_string(self):
         """Info to pretty print."""

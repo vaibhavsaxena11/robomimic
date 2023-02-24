@@ -5,6 +5,7 @@ import numpy as np
 from collections import OrderedDict
 import kornia
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -253,32 +254,46 @@ class BC_Implicit(BC):
         #     encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
         # )
         self.ac_implicit_dim = 2 # 3
+        enc_ac_implicit_dim = self.ac_implicit_dim
+        if self.algo_config.implicit.pos_enc_per_dim is not None:
+            enc_ac_implicit_dim *= self.algo_config.implicit.pos_enc_per_dim
+        self.nets["encoder"] = PolicyNets.EncoderForAffordance(
+            obs_shapes=self.obs_shapes,
+            encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+            recon_enabled=self.algo_config.implicit.L2backboneRecon_loss_enabled,
+            feat_stop_grad=self.algo_config.implicit.stopgrad_act2enc,
+        )
+        p = len([_ for _ in self.nets["encoder"].parameters()]); w = self.nets["encoder"].num_weights; print(f"Created encoder with {p} parameters and {w} weights.")
         self.nets["pick_policy"] = PolicyNets.AffordanceNetworkLite(
             obs_shapes=self.obs_shapes,
             goal_shapes=self.goal_shapes,
             feat_dim=self.algo_config.implicit.feat_dim, # added 4 for predicting orientation directly from the MIMO_MLP
-            ac_implicit_dim=self.ac_implicit_dim,#3,#self.ac_dim,#2,#3, #TODO(VS) make use of self.ac_dim for ac_implicit_dim and ac_explicit_dim
+            ac_implicit_dim=enc_ac_implicit_dim, #3,#self.ac_dim,#2,#3, #TODO(VS) make use of self.ac_dim for ac_implicit_dim and ac_explicit_dim
             ac_explicit_dim=4,
             mlp_layer_dims=self.algo_config.actor_layer_dims,
             affordance_layer_dims=self.algo_config.implicit.affordance_layer_dims,
-            activation=nn.Sigmoid,#nn.ReLU,#, #nn.Identity,
+            activation=nn.ReLU, # nn.Sigmoid, #
             # activation=nn.ReLU,#nn.ReLU,#, #nn.Identity,
             # pad_images=self.algo_config.implicit.pad_images,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+            shared_encoder=self.nets["encoder"],
         )
+        p = len([_ for _ in self.nets["pick_policy"].parameters()]); w = self.nets["pick_policy"].num_weights; print(f"Created pick_policy with {p} parameters and {w} weights.")
         self.nets["place_policy"] = PolicyNets.AffordanceNetworkLite(
             obs_shapes=self.obs_shapes,
             goal_shapes=self.goal_shapes,
             feat_dim=self.algo_config.implicit.feat_dim, # added 4 for predicting orientation directly from the MIMO_MLP
-            ac_implicit_dim=self.ac_implicit_dim,#3,#self.ac_dim,#2,#3, #TODO(VS) make use of self.ac_dim for ac_implicit_dim and ac_explicit_dim
+            ac_implicit_dim=enc_ac_implicit_dim, #3,#self.ac_dim,#2,#3, #TODO(VS) make use of self.ac_dim for ac_implicit_dim and ac_explicit_dim
             ac_explicit_dim=4,
             mlp_layer_dims=self.algo_config.actor_layer_dims,
             affordance_layer_dims=self.algo_config.implicit.affordance_layer_dims,
-            activation=nn.Sigmoid,#nn.ReLU,#, #nn.Identity,
+            activation=nn.ReLU, # nn.Sigmoid, #
             # activation=nn.ReLU,#nn.ReLU,#, #nn.Identity,
             # pad_images=self.algo_config.implicit.pad_images,
             encoder_kwargs=ObsUtils.obs_encoder_kwargs_from_config(self.obs_config.encoder),
+            shared_encoder=self.nets["encoder"],
         )
+        p = len([_ for _ in self.nets["place_policy"].parameters()]); w = self.nets["place_policy"].num_weights; print(f"Created place_policy with {p} parameters and {w} weights.")
         self.nets = self.nets.float().to(self.device)
 
     def train_on_batch(self, batch, epoch, validate=False):
@@ -309,6 +324,20 @@ class BC_Implicit(BC):
                 info.update(step_info)
 
         return info
+
+    def get_position_encoding(self, positions):
+        """
+        Adapted from https://pytorch.org/tutorials/beginner/transformer_tutorial.html
+        """
+        embed_per_dim = self.algo_config.implicit.pos_enc_per_dim
+        # positions is of shape (B, ..., N)
+        # this func will change the last dim to N*embed_per_dim
+        div_term = torch.exp(torch.arange(0, embed_per_dim, 2) * (-math.log(10000.0) / embed_per_dim)).to(self.device)
+        pe = torch.zeros(size=list(positions.shape)+[embed_per_dim]).to(self.device)
+        pe[..., 0::2] = torch.sin(positions.unsqueeze(-1) * div_term)
+        pe[..., 1::2] = torch.cos(positions.unsqueeze(-1) * div_term)
+        pe = torch.reshape(pe, list(pe.shape[:-2])+[-1]) # (B, ..., N*embed_per_dim)
+        return pe
 
     def _create_aff_grid(self, batch, policy_type, policy_dim="2d"):
         """
@@ -341,13 +370,17 @@ class BC_Implicit(BC):
         actions = torch.tensor(np.expand_dims(actions, 0))
         batch_size = batch["obs"][list(batch["obs"].keys())[0]].shape[0]
         actions = actions.tile([batch_size, 1, 1]).to(self.device)
-        affordances = self.nets[f"{policy_type}_policy"](batch["obs"], actions, batch["goal_obs"])[0]
+        actions_ = actions
+        if self.algo_config.implicit.pos_enc_per_dim is not None:
+            actions_ = self.get_position_encoding(actions)
+        affordances, _, enc_outputs = self.nets[f"{policy_type}_policy"](batch["obs"], actions_, batch["goal_obs"])
+        img_recon = enc_outputs["recon"]
 
         if policy_dim == "3d": #TODO(VS)
             # return torch.cat([actions, affordances], -1) # 3d only #TODO(VS)
             return NotImplementedError
         else:
-            return torch.reshape(affordances, [batch_size, gridsize_j, gridsize_i]), torch.reshape(actions, [batch_size, gridsize_j, gridsize_i, 2])
+            return torch.reshape(affordances, [batch_size, gridsize_j, gridsize_i]), torch.reshape(actions, [batch_size, gridsize_j, gridsize_i, 2]), img_recon
 
     def _compute_implicit_repro_loss(self, batch, losses):
         """
@@ -390,7 +423,6 @@ class BC_Implicit(BC):
             center[..., 0] = pivot[1]
             center[..., 1] = pivot[0]
 
-
             # compute the transformation matrix
             M: torch.tensor = kornia.geometry.transform.get_rotation_matrix2d(center, angle, scale)
 
@@ -415,7 +447,6 @@ class BC_Implicit(BC):
                 M: torch.tensor = kornia.geometry.transform.get_rotation_matrix2d(center, angle, scale)
 
                 b, _ = x.shape
-                # import pdb; pdb.set_trace()
                 x = torch.cat([x, torch.ones([b, 1]).to(x.device)], -1).unsqueeze(-1)
                 x_warped = torch.bmm(M.to(x.device), x).squeeze(-1)
             else:
@@ -439,25 +470,25 @@ class BC_Implicit(BC):
         ### TODO(VS) cleanup
 
         ### rotating images
-        batch = copy.deepcopy(batch) # TODO(VS) this should make sure that the original batch doesn't change, check!! this affects affordance logging
-        n_rotations = 10
-        for k in batch["obs"]:
-            if k in ObsUtils.OBS_MODALITIES_TO_KEYS["rgb"]:
-                img_rot_pivot = np.array(batch["obs"][k].shape[-2:]) // 2
-                batch["obs"][k] = self._rotate_inputs(batch["obs"][k], img_rot_pivot, n_rotations)
-        ###
-        ### rotating actions
-        act_rot_pivot = [0.5, 0] # hard-coded center (x,y) of table
-        if self.ac_implicit_dim == 2:
-            rotated_pick_tra = self._rotate_inputs(batch["actions"][:, :self.ac_implicit_dim], act_rot_pivot, n_rotations)
-            rotated_plac_tra = self._rotate_inputs(batch["actions"][:, 7:7+self.ac_implicit_dim], act_rot_pivot, n_rotations)
-            batch["actions"] = torch.tile(batch["actions"], [n_rotations, 1])
-            batch["actions"][:, :self.ac_implicit_dim] = rotated_pick_tra
-            batch["actions"][:, 7:7+self.ac_implicit_dim] = rotated_plac_tra
-        else:
-            # TODO(VS) rotation augmentation only works for 2D rotations, do for 3D rotations too
-            raise NotImplementedError
-        # TODO(VS) test rotated actions by plotting on rotated images
+        n_rotations = self.algo_config.implicit.num_aug_rotated_images # 10
+        if n_rotations > 0:
+            batch = copy.deepcopy(batch) # TODO(VS) this should make sure that the original batch doesn't change, check!! this affects affordance logging
+            for k in batch["obs"]:
+                if k in ObsUtils.OBS_MODALITIES_TO_KEYS["rgb"]:
+                    img_rot_pivot = np.array(batch["obs"][k].shape[-2:]) // 2
+                    batch["obs"][k] = self._rotate_inputs(batch["obs"][k], img_rot_pivot, n_rotations)
+            ###
+            ### rotating actions
+            act_rot_pivot = [0.5, 0] # hard-coded center (x,y) of table
+            if self.ac_implicit_dim == 2:
+                rotated_pick_tra = self._rotate_inputs(batch["actions"][:, :self.ac_implicit_dim], act_rot_pivot, n_rotations)
+                rotated_plac_tra = self._rotate_inputs(batch["actions"][:, 7:7+self.ac_implicit_dim], act_rot_pivot, n_rotations)
+                batch["actions"] = torch.tile(batch["actions"], [n_rotations, 1])
+                batch["actions"][:, :self.ac_implicit_dim] = rotated_pick_tra
+                batch["actions"][:, 7:7+self.ac_implicit_dim] = rotated_plac_tra
+            else:
+                # TODO(VS) rotation augmentation only works for 2D rotations, do for 3D rotations too
+                raise NotImplementedError
         ###
 
         # ###TODO(VS)(cleanup; remove) testing plots for rotated actions
@@ -487,6 +518,7 @@ class BC_Implicit(BC):
         losses["affordance_loss"] = 0.
         losses["l2_loss"] = 0.
         losses["action_loss"] = 0.
+        enc_outputs = None
         for ac in ["pick", "place"]:
             if ac == "pick":
                 a_implicit_target = a_target_pick_tra
@@ -495,6 +527,9 @@ class BC_Implicit(BC):
                 a_implicit_target = a_target_plac_tra
                 a_explicit_target = a_target_plac_ori
 
+            if self.algo_config.implicit.pos_enc_per_dim is not None:
+                a_implicit_target = self.get_position_encoding(a_implicit_target) # TODO(VS) get pos encoding from config
+
             # a_target = a_target[..., :2] ## 2D actions
             # # a_target[..., 0] = 0.5
             # # a_target[..., 1] = 0.5
@@ -502,7 +537,7 @@ class BC_Implicit(BC):
             # # a_target[:, 0, 0] = 0.3; a_target[:, 0, 1] = 0.3
             # # a_target[:, 1, 0] = 0.8; a_target[:, 1, 1] = 0.8
 
-            affordances, act_explicit = self.nets[f"{ac}_policy"](batch["obs"], a_implicit_target, batch["goal_obs"])
+            affordances, act_explicit, enc_outputs = self.nets[f"{ac}_policy"](batch["obs"], a_implicit_target, batch["goal_obs"], enc_outputs) # feats=None only the first time; reusing every other time
             assert len(affordances.shape) == 2, affordances.shape
             affordances = affordances.unsqueeze(1)
             losses[f"correct_{ac}_action_affordance_loss"] = torch.mean(affordances)
@@ -515,10 +550,15 @@ class BC_Implicit(BC):
             ## obtaining negative action examples for infoNCE loss
             ## insight: robot always moves in +ve x, but both +/- y
             num_wrong_exs = 256 # 512 # 100 # 100 10 # 256 # 
-            wrong_actions_posy = 1*torch.rand([a_implicit_target.shape[0], num_wrong_exs//2, a_implicit_target.shape[1]]).to(self.device)
-            wrong_actions_negy = 1*torch.rand([a_implicit_target.shape[0], num_wrong_exs//2, a_implicit_target.shape[1]]).to(self.device)
+            wrong_actions_posy = 1*torch.rand([a_implicit_target.shape[0], num_wrong_exs//2, self.ac_implicit_dim]).to(self.device)
+            wrong_actions_negy = 1*torch.rand([a_implicit_target.shape[0], num_wrong_exs//2, self.ac_implicit_dim]).to(self.device)
             wrong_actions_negy[:,:,1] *= -1
             wrong_actions = torch.cat([wrong_actions_posy, wrong_actions_negy], 1)
+
+            if self.algo_config.implicit.pos_enc_per_dim is not None:
+                wrong_actions = self.get_position_encoding(wrong_actions)
+
+
             # import pdb; pdb.set_trace()
             # import matplotlib.pyplot as plt
             # plt.figure()
@@ -541,7 +581,8 @@ class BC_Implicit(BC):
             # wrong_actions = torch.tile(torch.unsqueeze(a_target_pick_tra, 1), [1, num_wrong_exs, 1]) + action_deltas
             # XXX #
 
-            wrong_actions_affordances, _ = self.nets[f"{ac}_policy"](batch["obs"], wrong_actions, batch["goal_obs"])
+
+            wrong_actions_affordances, _, _ = self.nets[f"{ac}_policy"](batch["obs"], wrong_actions, batch["goal_obs"], enc_outputs)
             all_affordances = torch.cat([affordances, wrong_actions_affordances], 1)
 
             losses[f"wrong_{ac}_action_affordance_loss"] = torch.mean(torch.logsumexp(wrong_actions_affordances, 1))
@@ -566,8 +607,14 @@ class BC_Implicit(BC):
 
             losses["action_loss"] += losses[f"{ac}_policy_action_loss"]
 
-        if self.algo_config.implicit.L2recon_loss_enabled: # also for training IMPLICIT part of the policy
+        if self.algo_config.implicit.L2implicitRecon_loss_enabled: # also for training IMPLICIT part of the policy
             self._compute_implicit_repro_loss(batch, losses)
+
+        #TODO(VS) restructure encoder/backbone to get recon from a "decoder". This will prevent multiple (two) calls to decoder.
+        if self.algo_config.implicit.L2backboneRecon_loss_enabled:
+            imgs = batch["obs"][list(batch["obs"].keys())[0]] # TODO(VS) assuming "color_*" is the only key
+            losses["image_recon_loss"] = self.algo_config.implicit.L2backboneRecon_loss_weight * nn.MSELoss()(enc_outputs["recon"], imgs)
+            losses["action_loss"] += losses["image_recon_loss"]
         return losses
 
     def _train_step(self, losses):
@@ -581,13 +628,21 @@ class BC_Implicit(BC):
 
         # gradient step
         info = OrderedDict()
-        for k in self.nets:
-            grad_norms = TorchUtils.backprop_for_loss(
-                net=self.nets[k],
-                optim=self.optimizers[k],
-                loss=losses[f"{k}_action_loss"],
-            )
-            info[f"{k}_grad_norms"] = grad_norms
+        # for k in self.nets:
+        #     grad_norms = TorchUtils.backprop_for_loss(
+        #         net=self.nets[k],
+        #         optim=self.optimizers[k],
+        #         loss=losses[f"{k}_action_loss"],
+        #     )
+        #     info[f"{k}_grad_norms"] = grad_norms
+
+        grad_norms = TorchUtils.backprop_for_loss_multimodule(
+            net=self.nets,
+            optim=self.optimizers,
+            loss=losses[f"action_loss"],
+        )
+        for k in grad_norms:
+            info[f"{k}_grad_norms"] = grad_norms[k]
         return info
 
     def log_info(self, info):
@@ -615,6 +670,8 @@ class BC_Implicit(BC):
             log["Correct_Action_Affordance_Loss"] = info["losses"]["correct_action_affordance_loss"].item()
         if "wrong_action_affordance_loss" in info["losses"]:
             log["Wrong_Action_Affordance_Loss"] = info["losses"]["wrong_action_affordance_loss"].item()
+        if "image_recon_loss" in info["losses"]:
+            log["Image_Recon_Loss"] = info["losses"]["image_recon_loss"].item()
 
         # Logging pick and place losses if they exist.
         # Pick
@@ -650,6 +707,8 @@ class BC_Implicit(BC):
             log["Pick_Policy_Grad_Norms"] = info["pick_policy_grad_norms"]
         if "place_policy_grad_norms" in info:
             log["Place_Policy_Grad_Norms"] = info["place_policy_grad_norms"]
+        if "encoder_grad_norms" in info:
+            log["Encoder_Grad_Norms"] = info["encoder_grad_norms"]
 
         return log
 
@@ -665,6 +724,7 @@ class BC_Implicit(BC):
             action (torch.Tensor): action tensor
         """
         ### TODO(VS) cleanup
+        ##TODO(VS) add support for positional encoding as in other functions of this class
 
         def plot_aff(aff):
             import pylab
@@ -697,13 +757,13 @@ class BC_Implicit(BC):
         for ac in ["pick", "place"]:
             #####
             # import pdb; pdb.set_trace()
-            aff = self._create_aff_grid({"obs": obs_dict,  "goal_obs": None}, policy_type=ac, policy_dim=f"{self.ac_implicit_dim}d")
+            aff, _, _ = self._create_aff_grid({"obs": obs_dict,  "goal_obs": None}, policy_type=ac, policy_dim=f"{self.ac_implicit_dim}d")
             # plot_aff2d(aff[0].detach().numpy())
             # plot_aff2d(obs_dict["color_ortho"][0].transpose(0,1).transpose(1,2))
 
             ### old plotting, but still good for action selection ###
             from robomimic.utils.train_utils import _create_affordance_grid
-            aff = _create_affordance_grid(self, {"obs": obs_dict, "goal_obs": None}, policy_type=ac, policy_dim=f"{self.ac_implicit_dim}d")
+            aff, _ = _create_affordance_grid(self, {"obs": obs_dict, "goal_obs": None}, policy_type=ac, policy_dim=f"{self.ac_implicit_dim}d")
             # plot_aff2d(aff[0,...,-1])
             ###
 
@@ -717,27 +777,27 @@ class BC_Implicit(BC):
             # act = torch.rand([batch_size, self.ac_implicit_dim]).to(self.device)
             # act[:,-1] = 0.0 # manually setting initial z=0
 
-            affordance, _ = self.nets[f"{ac}_policy"](obs_dict, act, goal_dict=goal_dict)
+            affordance, _, _ = self.nets[f"{ac}_policy"](obs_dict, act, goal_dict=goal_dict)
             
             n_iters_mcmc = 10
             for _ in range(n_iters_mcmc):
                 new_actions = act + torch.rand([batch_size, self.ac_implicit_dim]).to(self.device)
-                new_affordance, _ = self.nets[f"{ac}_policy"](obs_dict, new_actions, goal_dict=goal_dict)
+                new_affordance, _, _ = self.nets[f"{ac}_policy"](obs_dict, new_actions, goal_dict=goal_dict)
                 choose_next_detr = new_affordance > affordance
                 # choose_next_rand = torch.rand([batch_size]) < torch.exp(new_affordance - affordance) # TODO(VS)
                 choose_next_rand = torch.tensor([[False]])
-                choose_next = (choose_next_detr or choose_next_rand).float()
+                choose_next = (choose_next_detr or choose_next_rand).float().to(self.device)
                 act = choose_next*new_actions + (1-choose_next)*act
                 affordance = choose_next*new_affordance + (1-choose_next)*affordance
             
             if ac == "pick":
-                _, act_explicit = self.nets[f"{ac}_policy"](obs_dict, new_actions, goal_dict=goal_dict)
+                _, act_explicit, _ = self.nets[f"{ac}_policy"](obs_dict, new_actions, goal_dict=goal_dict)
                 actions[:,:self.ac_implicit_dim] = act
                 if self.ac_implicit_dim == 2:
                     actions[:,2] = 0.04 # hard-coded pick height
                 actions[:,3:7] = act_explicit
             else:
-                _, act_explicit = self.nets[f"{ac}_policy"](obs_dict, new_actions, goal_dict=goal_dict)
+                _, act_explicit, _ = self.nets[f"{ac}_policy"](obs_dict, new_actions, goal_dict=goal_dict)
                 actions[:,7:7+self.ac_implicit_dim] = act
                 if self.ac_implicit_dim == 2:
                     actions[:,9] = 0.02 # hard-coded place height
