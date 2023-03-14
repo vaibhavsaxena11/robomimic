@@ -47,6 +47,8 @@ def get_torch_device(try_to_use_cuda):
     if try_to_use_cuda and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         device = torch.device("cuda:0")
+    # elif try_to_use_cuda and torch.backends.mps.is_available():
+    #     device = torch.device("mps") ## TODO(VS) put this back in; removed because pairwise_distance.topk (in ndf_robot code) on mps works only for k<=16, we trying to do k=20
     else:
         device = torch.device("cpu")
     return device
@@ -174,6 +176,52 @@ def backprop_for_loss(net, optim, loss, max_grad_norm=None, retain_graph=False):
 
     # step
     optim.step()
+
+    return grad_norms
+
+
+def backprop_for_loss_multimodule(net, optim, loss, max_grad_norm=None, retain_graph=False):
+    """
+    Backpropagate loss and update parameters for a multi-module network with
+    name @name.
+
+    Args:
+        net (dict(torch.nn.Module)): networks to update
+
+        optim (dict(torch.optim.Optimizer)): optimizers to use for each net
+
+        loss (torch.Tensor): loss to use for backpropagation
+
+        max_grad_norm (float): if provided, used to clip gradients
+
+        retain_graph (bool): if True, graph is not freed after backward call
+
+    Returns:
+        grad_norms (dict(float)): average gradient norms from backpropagation
+    """
+    assert isinstance(optim, dict)
+    assert set(net).issubset(set(optim)), "Optimizer corresponding to at least one net missing."
+
+    # backprop
+    for k in net:
+        optim[k].zero_grad()
+    loss.backward(retain_graph=retain_graph)
+
+    # gradient clipping
+    if max_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm)
+
+    # compute grad norms
+    grad_norms = dict([(k, 0.) for k in net])
+    for k in net:
+        for p in net[k].parameters():
+            # only clip gradients for parameters for which requires_grad is True
+            if p.grad is not None:
+                grad_norms[k] += p.grad.data.norm(2).pow(2).item()
+
+    # step
+    for k in net:
+        optim[k].step()
 
     return grad_norms
 

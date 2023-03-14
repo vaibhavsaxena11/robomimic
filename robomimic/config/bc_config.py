@@ -81,3 +81,17 @@ class BCConfig(BaseConfig):
         self.algo.rnn.open_loop = False     # if True, action predictions are only based on a single observation (not sequence)
         self.algo.rnn.kwargs.bidirectional = False            # rnn kwargs
         self.algo.rnn.kwargs.do_not_lock_keys()
+
+        # Implicit policy settings
+        self.algo.implicit.enabled = False                                  # whether to train an implicit policy
+        self.algo.implicit.feat_dim = 100
+        self.algo.implicit.affordance_layer_dims = (300, 300, 1)
+        self.algo.implicit.pad_images = False
+        self.algo.implicit.num_aug_rotated_images = 0                       # num rotations to do for each image; batch_size grows by this factor
+        self.algo.implicit.L2explicit_loss_enabled = True                   # L2 loss for training explicit actions
+        self.algo.implicit.NCEimplicit_loss_enabled = True                  # NCE loss for training implicit actions
+        self.algo.implicit.L2implicitRecon_loss_enabled = False             # L2 loss for training implicit actions by reconstructing input
+        self.algo.implicit.L2backboneRecon_loss_enabled = False             # L2 loss for training encoder backbone by reconstructing input
+        self.algo.implicit.L2backboneRecon_loss_weight = 1.0
+        self.algo.implicit.stopgrad_act2enc = False                         # stop gradient from action to encoder backbone
+        self.algo.implicit.pos_enc_per_dim = None

@@ -11,6 +11,8 @@ import json
 import h5py
 import imageio
 import numpy as np
+import numbers
+import pathlib
 from copy import deepcopy
 from collections import OrderedDict
 
@@ -206,11 +208,23 @@ def run_rollout(
     total_reward = 0.
     success = { k: False for k in env.is_success() } # success metrics
 
+    ac_strings = []
+    if env.name == "Ravens":
+        pick_error = 0.
+        place_error = 0.
+        n_horizon = 0
     try:
         for step_i in range(horizon):
 
             # get action from policy
             ac = policy(ob=ob_dict, goal=goal_dict)
+            ac_strings.append(f"t={step_i} {str(ac)}")
+
+            if env.name == "Ravens":
+                ac_oracle = env.oracle.act(env.env._get_obs(), None)
+                pick_error += np.linalg.norm(ac_oracle["pose0"][0] - ac[:3])
+                place_error += np.linalg.norm(ac_oracle["pose1"][0] - ac[7:10])
+                n_horizon += 1
 
             # play action
             ob_dict, r, done, _ = env.step(ac)
@@ -244,6 +258,10 @@ def run_rollout(
     results["Return"] = total_reward
     results["Horizon"] = step_i + 1
     results["Success_Rate"] = float(success["task"])
+    results["Actions"] = ac_strings
+    if env.name == "Ravens":
+        results["Avg_Pick_Error"] = pick_error/n_horizon
+        results["Avg_Place_Error"] = place_error/n_horizon
 
     # log additional success metrics
     for k in success:
@@ -365,9 +383,21 @@ def rollout_with_stats(
             env_video_writer.close()
 
         # average metric across all episodes
+        numeric_keys = [k for k, v in rollout_logs[0].items() if isinstance(v, numbers.Number)]
+        nonnumeric_keys = list(set(rollout_logs[0].keys()).difference(set(numeric_keys)))
         rollout_logs = dict((k, [rollout_logs[i][k] for i in range(len(rollout_logs))]) for k in rollout_logs[0])
-        rollout_logs_mean = dict((k, np.mean(v)) for k, v in rollout_logs.items())
+        rollout_logs_mean = dict((k, np.mean(v)) for k, v in rollout_logs.items() if k in numeric_keys)
         rollout_logs_mean["Time_Episode"] = np.sum(rollout_logs["time"]) / 60. # total time taken for rollouts in minutes
+        # writing non-numeric logs to txt file
+        for k in nonnumeric_keys:
+            # rollout_logs_mean[k] = rollout_logs[k]
+            fname = pathlib.Path(video_paths[env_name]).stem + f"_{k}.txt"
+            fpath = pathlib.Path(video_paths[env_name]).parent / fname
+            full_str = ""
+            for i, s in enumerate(rollout_logs[k]):
+                full_str += f"Episode {i}" + "\n" + "\n".join(s) + "\n\n"
+            with open(fpath, 'w') as f:
+                f.write(full_str)
         all_rollout_logs[env_name] = rollout_logs_mean
 
     if video_path is not None:
@@ -484,7 +514,57 @@ def save_model(model, config, env_meta, shape_meta, ckpt_path, obs_normalization
     print("save checkpoint to {}".format(ckpt_path))
 
 
-def run_epoch(model, data_loader, epoch, validate=False, num_steps=None):
+# TODO(VS) remove commented code below
+# def _create_affordance_grid(model, batch, policy_type="pick", policy_dim="2d"):
+#     # Creating 3D affordance map. # TODO(VS) move this to bc.py if possible
+
+#     if policy_dim == "3d":
+#         raise NotImplementedError
+#         # creating 3D action grid
+#         actions = (np.mgrid[0:20, -10:10, 0:4]/20).transpose([1,2,3,0]).astype(np.float32) # shape (20, 20, 4, 3)
+#         actions = actions.reshape([-1, 3])
+#     else:
+#         # creating 2D action grid
+#         gridsize = 100
+#         actions = (np.mgrid[0:gridsize, -gridsize//2:gridsize//2]/gridsize).transpose([2,1,0]).astype(np.float32) # shape (gridsize_x, gridsize_y, 2)
+#         actions = actions.reshape([-1, 2])
+
+#     # tiling grid to batch size
+#     actions = torch.tensor(np.expand_dims(actions, 0))
+#     batch_size = batch["obs"][list(batch["obs"].keys())[0]].shape[0]
+#     actions = actions.tile([batch_size, 1, 1]).to(model.device)
+
+#     import pdb; pdb.set_trace()
+#     affordances, actions = model._create_aff_grid(batch, policy_type, policy_dim)
+
+#     affordances = TensorUtils.detach(model.nets[f"{policy_type}_policy"](batch["obs"], actions, batch["goal_obs"])[0])
+
+#     # affordances = torch.reshape(affordances, [batch_size, 10, 10, 10, 1])
+#     # actions = actions.reshape([batch_size, 10, 10, 10, 3])
+
+#     if policy_dim == "3d":
+#         return torch.cat([actions, affordances], -1) # 3d only
+#     else:
+#         actions = actions.reshape([batch_size, gridsize, gridsize, 2])
+#         return torch.cat([actions, torch.reshape(affordances, [batch_size, gridsize, gridsize, 1])], -1) # 2d only
+
+
+def _create_affordance_grid(model, batch, policy_type="pick", policy_dim="2d"):
+    # Creating 3D affordance map. # TODO(VS) move this to bc.py if possible
+
+    if policy_dim == "3d":
+        raise NotImplementedError
+        # creating 3D action grid
+        actions = (np.mgrid[0:20, -10:10, 0:4]/20).transpose([1,2,3,0]).astype(np.float32) # shape (20, 20, 4, 3)
+        actions = actions.reshape([-1, 3])
+    else:
+        # obtaining 2D action grid and affordance from model._create_aff_grid()
+        affordances, actions, img_recon = model._create_aff_grid(batch, policy_type, policy_dim)
+        # concatenating actions and affordances before returning
+        return torch.cat([actions, TensorUtils.detach(affordances).unsqueeze(-1)], -1), img_recon
+
+
+def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, debug=False):
     """
     Run an epoch of training or validation.
 
@@ -505,6 +585,9 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None):
     Returns:
         step_log_all (dict): dictionary of logged training metrics averaged across all batches
     """
+    if debug:
+        if not validate: return {}, None, None, None
+
     epoch_timestamp = time.time()
     if validate:
         model.set_eval()
@@ -518,6 +601,9 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None):
     start_time = time.time()
 
     data_loader_iter = iter(data_loader)
+    affordances = {"pick":[], "place":[]}
+    input_imgs = {}
+    img_recons = {"pick":[], "place":[]}
     for _ in LogUtils.custom_tqdm(range(num_steps)):
 
         # load next batch from data loader
@@ -547,6 +633,14 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None):
         step_log_all.append(step_log)
         timing_stats["Log_Info"].append(time.time() - t)
 
+        # obtain affordance grid
+        if epoch % 1 == 0:# or validate:
+            for ptype in affordances:
+                aff, recon = _create_affordance_grid(model, input_batch, policy_type=ptype, policy_dim="2d")
+                affordances[ptype].append(aff.detach().cpu().numpy())
+                if recon is not None:
+                    img_recons[ptype].append(recon.detach().cpu().numpy())
+
     # flatten and take the mean of the metrics
     step_log_dict = {}
     for i in range(len(step_log_all)):
@@ -562,7 +656,24 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None):
         step_log_all["Time_{}".format(k)] = np.sum(timing_stats[k]) / 60.
     step_log_all["Time_Epoch"] = (time.time() - epoch_timestamp) / 60.
 
-    return step_log_all
+    # flatten affordance list
+    if len(affordances[list(affordances.keys())[0]]) > 0:
+        bs = len(input_batch["obs"][list(input_batch["obs"].keys())[0]]) # batch_size
+        bs = min([bs, 4])
+        for ptype in affordances:
+            affordances[ptype] = np.concatenate(affordances[ptype], 0)[-bs:]
+            if len(img_recons[ptype]) > 0:
+                img_recons[ptype] = dict((k, np.concatenate(img_recons[ptype], 0)[-bs:]) for k in input_batch["obs"]) #TODO(VS) (multi-view experiments) get more recons for each image-type and log accordingly in inner dict.
+            else:
+                img_recons[ptype] = None
+        input_imgs = dict((k, input_batch["obs"][k].detach().cpu().numpy()[-bs:]) for k in input_batch["obs"])
+
+    else:
+        affordances = None
+        input_imgs = None
+        img_recons = None
+
+    return step_log_all, affordances, input_imgs, img_recons
 
 
 def is_every_n_steps(interval, current_step, skip_zero=False):

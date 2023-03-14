@@ -157,6 +157,62 @@ class Squeeze(Module):
         return x.squeeze(dim=self.dim)
 
 
+class ResNetMLP(Module):
+    """
+    Basic ResNet block.
+
+    Forward returns the following:
+        output_activation ( model(input) + activation(layer_func(input)) )
+    """
+    def __init__(
+        self, 
+        model, 
+        input_dim,
+        output_dim, 
+        layer_func=nn.Linear,
+        layer_func_kwargs=None,
+        activation=nn.ReLU,
+        output_activation=None,
+    ):
+        """
+        Args:
+            input_dim (int): dimension of inputs
+
+            output_dim (int): dimension of outputs
+
+            layer_func: func for processing input (single layer) - defaults to Linear
+
+            layer_func_kwargs (dict): kwargs for @layer_func
+
+            activation: non-linearity after layer_func - defaults to ReLU
+
+            output_activation: if provided, applies the provided non-linearity after adding residual
+        """
+        super(ResNetMLP, self).__init__()
+        self.model = model
+        self._input_dim = input_dim
+        self._output_dim = output_dim
+
+        if layer_func_kwargs is None:
+            layer_func_kwargs = dict()
+
+        # single layer MLP for converting input to dim output_dim.
+        layers = [layer_func(input_dim, output_dim, **layer_func_kwargs)]
+        if activation is not None:
+            layers.append(activation())
+        self._model = nn.Sequential(*layers)
+        self.output_activation = output_activation
+
+    def output_shape(self, input_shape=None):
+        [self._output_dim]
+
+    def forward(self, inputs):
+        out =  self.model(inputs) + self._model(inputs)
+        if self.output_activation is not None:
+            out = self.output_activation(out)
+        return out
+
+
 class MLP(Module):
     """
     Base class for simple Multi-Layer Perceptrons.
@@ -172,6 +228,7 @@ class MLP(Module):
         dropouts=None,
         normalization=False,
         output_activation=None,
+        residual=False,
     ):
         """
         Args:
@@ -210,6 +267,9 @@ class MLP(Module):
                 layers.append(nn.Dropout(dropouts[i]))
             dim = l
         layers.append(layer_func(dim, output_dim))
+        if residual:
+            model = nn.Sequential(*layers)
+            layers = [ResNetMLP(model, input_dim, output_dim, layer_func=layer_func, layer_func_kwargs=layer_func_kwargs, activation=activation, output_activation=None)]
         if output_activation is not None:
             layers.append(output_activation())
         self._layer_func = layer_func
@@ -498,6 +558,201 @@ class ResNet18Conv(ConvBase):
         """Pretty print network."""
         header = '{}'.format(str(self.__class__.__name__))
         return header + '(input_channel={}, input_coord_conv={})'.format(self._input_channel, self._input_coord_conv)
+
+
+class ResNet50Conv(ConvBase):
+    """
+    A ResNet50 block that can be used to process input images.
+    """
+    def __init__(
+        self,
+        input_channel=3,
+        pretrained=False,
+        input_coord_conv=False,
+    ):
+        """
+        Args:
+            input_channel (int): number of input channels for input images to the network.
+                If not equal to 3, modifies first conv layer in ResNet to handle the number
+                of input channels.
+            pretrained (bool): if True, load pretrained weights for all ResNet layers.
+            input_coord_conv (bool): if True, use a coordinate convolution for the first layer
+                (a convolution where input channels are modified to encode spatial pixel location)
+        """
+        super(ResNet50Conv, self).__init__()
+        net = vision_models.resnet50(pretrained=pretrained)
+
+        if input_coord_conv:
+            net.conv1 = CoordConv2d(input_channel, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        elif input_channel != 3:
+            net.conv1 = nn.Conv2d(input_channel, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
+        # cut the last fc layer
+        self._input_coord_conv = input_coord_conv
+        self._input_channel = input_channel
+        self.nets = torch.nn.Sequential(*(list(net.children())[:-2]))
+
+    def output_shape(self, input_shape):
+        """
+        Function to compute output shape from inputs to this module. 
+
+        Args:
+            input_shape (iterable of int): shape of input. Does not include batch dimension.
+                Some modules may not need this argument, if their output does not depend 
+                on the size of the input, or if they assume fixed size input.
+
+        Returns:
+            out_shape ([int]): list of integers corresponding to output shape
+        """
+        assert(len(input_shape) == 3)
+        out_h = int(math.ceil(input_shape[1] / 32.))
+        out_w = int(math.ceil(input_shape[2] / 32.))
+        return [2048, out_h, out_w]
+
+    def __repr__(self):
+        """Pretty print network."""
+        header = '{}'.format(str(self.__class__.__name__))
+        return header + '(input_channel={}, input_coord_conv={})'.format(self._input_channel, self._input_coord_conv)
+
+
+class UNetConv(ConvBase):
+    def __init__(
+        self,
+        input_channel=3,
+        pretrained=False, #TODO(VS)
+        init_features=32,
+        recon_enabled=False,
+    ):
+        """
+        Architecture from: https://github.com/mateuszbuda/brain-segmentation-pytorch
+        """
+        super(UNetConv, self).__init__()
+        self._input_channel = input_channel
+        self._output_channel = input_channel
+        self.init_features = init_features
+        self.recon_enabled = recon_enabled
+
+        # self.net = torch.hub.load('mateuszbuda/brain-segmentation-pytorch', 'unet', in_channels=input_channel, out_channels=input_channel, init_features=self.init_features, pretrained=pretrained)
+        self.net = self._create_network()
+
+    def _create_network(self):
+        features = self.init_features
+        in_channels = self._input_channel
+        out_channels = self._output_channel
+
+        self.encoder1 = UNetConv._block(in_channels, features, name="enc1")
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder2 = UNetConv._block(features, features * 2, name="enc2")
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder3 = UNetConv._block(features * 2, features * 4, name="enc3")
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder4 = UNetConv._block(features * 4, features * 8, name="enc4")
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.bottleneck = UNetConv._block(features * 8, features * 16, name="bottleneck")
+
+        self.upconv4 = nn.ConvTranspose2d(
+            features * 16, features * 8, kernel_size=2, stride=2
+        )
+        self.decoder4 = UNetConv._block((features * 8) * 2, features * 8, name="dec4")
+        self.upconv3 = nn.ConvTranspose2d(
+            features * 8, features * 4, kernel_size=2, stride=2
+        )
+        self.decoder3 = UNetConv._block((features * 4) * 2, features * 4, name="dec3")
+        self.upconv2 = nn.ConvTranspose2d(
+            features * 4, features * 2, kernel_size=2, stride=2
+        )
+        self.decoder2 = UNetConv._block((features * 2) * 2, features * 2, name="dec2")
+        self.upconv1 = nn.ConvTranspose2d(
+            features * 2, features, kernel_size=2, stride=2
+        )
+        self.decoder1 = UNetConv._block(features * 2, features, name="dec1")
+
+        self.conv = nn.Conv2d(
+            in_channels=features, out_channels=out_channels, kernel_size=1
+        )
+
+    @staticmethod
+    def _block(in_channels, features, name):
+        return nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        name + "conv1",
+                        nn.Conv2d(
+                            in_channels=in_channels,
+                            out_channels=features,
+                            kernel_size=3,
+                            padding=1,
+                            bias=False,
+                        ),
+                    ),
+                    # (name + "norm1", nn.BatchNorm2d(num_features=features)),
+                    (name + "relu1", nn.ReLU(inplace=True)),
+                    (
+                        name + "conv2",
+                        nn.Conv2d(
+                            in_channels=features,
+                            out_channels=features,
+                            kernel_size=3,
+                            padding=1,
+                            bias=False,
+                        ),
+                    ),
+                    # (name + "norm2", nn.BatchNorm2d(num_features=features)),
+                    (name + "relu2", nn.ReLU(inplace=True)),
+                ]
+            )
+        )
+
+    def output_shape(self, input_shape):
+        """
+        Function to compute output shape from inputs to this module. 
+
+        Args:
+            input_shape (iterable of int): shape of input. Does not include batch dimension.
+                Some modules may not need this argument, if their output does not depend 
+                on the size of the input, or if they assume fixed size input.
+
+        Returns:
+            out_shape ([int]): list of integers corresponding to output shape
+        """
+        assert(len(input_shape) == 3)
+        out_h = int(math.ceil(input_shape[1] / 16.))
+        out_w = int(math.ceil(input_shape[2] / 16.))
+        return [self.init_features * 16, out_h, out_w]
+
+    def forward(self, inputs):
+        enc1 = self.encoder1(inputs)
+        enc2 = self.encoder2(self.pool1(enc1))
+        enc3 = self.encoder3(self.pool2(enc2))
+        enc4 = self.encoder4(self.pool3(enc3))
+
+        bottleneck = self.bottleneck(self.pool4(enc4))
+
+        if not self.recon_enabled:
+            return {"feats": bottleneck, "recon": None}
+
+        dec4 = self.upconv4(bottleneck)
+        dec4 = torch.cat((dec4, enc4), dim=1)
+        dec4 = self.decoder4(dec4)
+        dec3 = self.upconv3(dec4)
+        dec3 = torch.cat((dec3, enc3), dim=1)
+        dec3 = self.decoder3(dec3)
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.decoder2(dec2)
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.decoder1(dec1)
+        recon = torch.sigmoid(self.conv(dec1))
+
+        return {"feats": bottleneck, "recon": recon}
+
+    def __repr__(self):
+        """Pretty print network."""
+        header = '{}'.format(str(self.__class__.__name__))
+        return header + '(input_channel={})'.format(self._input_channel)
 
 
 class CoordConv2d(nn.Conv2d, Module):
@@ -1064,6 +1319,241 @@ class VisualCore(EncoderCore, ConvBase):
         msg += textwrap.indent("\npool_net={}".format(self.pool), indent)
         msg = header + '(' + msg + '\n)'
         return msg
+
+## TODO(VS) cleanup comments
+## PointNet (https://arxiv.org/pdf/1612.00593.pdf) ##
+## Source: https://github.com/fxia22/pointnet.pytorch/blob/f0c2430b0b1529e3f76fb5d6cd6ca14be763d975/pointnet/model.py
+class STN3d(nn.Module):
+    """ Helper class for PointNetFeat. Predicts 3x3 input transformation matrices. """
+    def __init__(self, batch_norm=True, channel_multiplier=1):
+        super(STN3d, self).__init__()
+        # input shape: (B, 3, N)
+        self.channel_multiplier = channel_multiplier
+        self.conv1 = torch.nn.Conv1d(3, 64*channel_multiplier, 1) # out shape: (B, 64, N)
+        self.conv2 = torch.nn.Conv1d(64*channel_multiplier, 128*channel_multiplier, 1) # out shape: (B, 128, N)
+        self.conv3 = torch.nn.Conv1d(128*channel_multiplier, 1024*channel_multiplier, 1) # out shape: (B, 1024, N)
+        self.fc1 = nn.Linear(1024*channel_multiplier, 512*channel_multiplier)
+        self.fc2 = nn.Linear(512*channel_multiplier, 256*channel_multiplier)
+        self.fc3 = nn.Linear(256*channel_multiplier, 9)
+        self.relu = nn.ReLU()
+        self.batch_norm = batch_norm
+
+        self.act1 = lambda x: self.relu(x)
+        self.act2 = lambda x: self.relu(x)
+        self.act3 = lambda x: self.relu(x)
+        self.act4 = lambda x: self.relu(x)
+        self.act5 = lambda x: self.relu(x)
+        if self.batch_norm:
+            self.bn1 = nn.BatchNorm1d(64*channel_multiplier)
+            self.bn2 = nn.BatchNorm1d(128*channel_multiplier)
+            self.bn3 = nn.BatchNorm1d(1024*channel_multiplier)
+            self.bn4 = nn.BatchNorm1d(512*channel_multiplier)
+            self.bn5 = nn.BatchNorm1d(256*channel_multiplier)
+            self.act1 = lambda x: self.bn1(self.relu(x))
+            self.act2 = lambda x: self.bn2(self.relu(x))
+            self.act3 = lambda x: self.bn3(self.relu(x))
+            self.act4 = lambda x: self.bn4(self.relu(x))
+            self.act5 = lambda x: self.bn5(self.relu(x))
+
+    def forward(self, x):
+        # input shape: (B, 3, N)
+        batchsize = x.size()[0]
+        x = self.act1(self.conv1(x)) # out shape: (B, 64, N)
+        x = self.act2(self.conv2(x)) # out shape: (B, 128, N)
+        x = self.act3(self.conv3(x)) # out shape: (B, 1024, N)
+        x = torch.max(x, 2, keepdim=True)[0] # max-pool across points dimension; out shape: (B, 1024, 1)
+        x = x.view(-1, 1024*self.channel_multiplier) # out shape: (B, 1024)
+
+        x = self.act4(self.fc1(x)) # out shape: (B, 512)
+        x = self.act5(self.fc2(x)) # out shape: (B, 256)
+        x = self.fc3(x) # out shape: (B, 9)
+
+        iden = torch.autograd.Variable(torch.from_numpy(np.array([1,0,0,0,1,0,0,0,1]).astype(np.float32))).view(1,9).repeat(batchsize, 1)
+        iden = iden.to(x.device)
+        x = x + iden
+        x = x.view(-1, 3, 3)
+        return x
+
+
+class STNkd(nn.Module):
+    """ Helper class for PointNetFeat. Predicts feature transformation matrices. """
+    def __init__(self, k=64, batch_norm=True, channel_multiplier=1):
+        super(STNkd, self).__init__()
+        self.channel_multiplier = channel_multiplier
+        self.conv1 = torch.nn.Conv1d(k, 64*self.channel_multiplier, 1)
+        self.conv2 = torch.nn.Conv1d(64*self.channel_multiplier, 128*self.channel_multiplier, 1)
+        self.conv3 = torch.nn.Conv1d(128*self.channel_multiplier, 1024*self.channel_multiplier, 1)
+        self.fc1 = nn.Linear(1024*self.channel_multiplier, 512*self.channel_multiplier)
+        self.fc2 = nn.Linear(512*self.channel_multiplier, 256*self.channel_multiplier)
+        self.fc3 = nn.Linear(256*self.channel_multiplier, k*k)
+        self.relu = nn.ReLU()
+        self.batch_norm = batch_norm
+
+        self.act1 = lambda x: self.relu(x)
+        self.act2 = lambda x: self.relu(x)
+        self.act3 = lambda x: self.relu(x)
+        self.act4 = lambda x: self.relu(x)
+        self.act5 = lambda x: self.relu(x)
+        if self.batch_norm:
+            self.bn1 = nn.BatchNorm1d(64*channel_multiplier)
+            self.bn2 = nn.BatchNorm1d(128*channel_multiplier)
+            self.bn3 = nn.BatchNorm1d(1024*channel_multiplier)
+            self.bn4 = nn.BatchNorm1d(512*channel_multiplier)
+            self.bn5 = nn.BatchNorm1d(256*channel_multiplier)
+            self.act1 = lambda x: self.bn1(self.relu(x))
+            self.act2 = lambda x: self.bn2(self.relu(x))
+            self.act3 = lambda x: self.bn3(self.relu(x))
+            self.act4 = lambda x: self.bn4(self.relu(x))
+            self.act5 = lambda x: self.bn5(self.relu(x))
+
+        self.k = k
+
+    def forward(self, x):
+        batchsize = x.size()[0]
+        x = self.act1(self.conv1(x))
+        x = self.act2(self.conv2(x))
+        x = self.act3(self.conv3(x))
+        x = torch.max(x, 2, keepdim=True)[0]
+        x = x.view(-1, 1024*self.channel_multiplier)
+
+        x = self.act4(self.fc1(x))
+        x = self.act5(self.fc2(x))
+        x = self.fc3(x)
+
+        iden = torch.nn.Variable(torch.from_numpy(np.eye(self.k).flatten().astype(np.float32))).view(1,self.k*self.k).repeat(batchsize,1)
+        iden = iden.to(x.device)
+        x = x + iden
+        x = x.view(-1, self.k, self.k)
+        return x
+
+class PointNetFeat(nn.Module):
+    """ Helper class for PointNet. Predicts features from inputs. """
+    def __init__(self, global_feat_only=True, feature_transform=False, batch_norm=True, channel_multiplier=1, pool="max"):
+        super(PointNetFeat, self).__init__()
+        self.channel_multiplier = channel_multiplier
+        self.conv1 = torch.nn.Conv1d(3, 64*self.channel_multiplier, 1)
+        self.conv2 = torch.nn.Conv1d(64*self.channel_multiplier, 128*self.channel_multiplier, 1)
+        self.conv3 = torch.nn.Conv1d(128*self.channel_multiplier, 1024, 1)
+        self.relu = nn.ReLU()
+        self.batch_norm = batch_norm
+        self.pool = pool
+        assert self.pool in ["max", "avg"], f"Pooling method {self.pool} not supported."
+        self.stn = STN3d(batch_norm=self.batch_norm, channel_multiplier=self.channel_multiplier) # input transformation class
+
+        self.act1 = lambda x: self.relu(x)
+        self.act2 = lambda x: self.relu(x)
+        self.act3 = lambda x: x
+        if self.batch_norm:
+            self.bn1 = nn.BatchNorm1d(64)
+            self.bn2 = nn.BatchNorm1d(128)
+            self.bn3 = nn.BatchNorm1d(1024)
+            self.act1 = lambda x: self.bn1(self.relu(x))
+            self.act2 = lambda x: self.bn2(self.relu(x))
+            self.act3 = lambda x: self.bn3(x)
+
+
+        self.global_feat = global_feat_only
+        self.feature_transform = feature_transform
+        if self.feature_transform:
+            self.fstn = STNkd(k=64, batch_norm=self.batch_norm, channel_multiplier=self.channel_multiplier) # feature transformation class
+
+    def forward(self, x):
+        n_pts = x.size()[2] # input shape (B, 3, n_pts)
+        trans = self.stn(x) # (B, 3, 3) input transformation matrices
+        x = x.transpose(2, 1) # (B, 3, N) -> (B, N, 3)
+        x = torch.bmm(x, trans) # (B, N, 3)
+        x = x.transpose(2, 1) # after input transform; (B, N, 3) -> (B, 3, N)
+        x = self.act1(self.conv1(x)) # final feature shape (B, 64, N)
+
+        if self.feature_transform:
+            trans_feat = self.fstn(x) # (B, 64, 64) feature transformation matrices
+            x = x.transpose(2, 1) # (B, 64, N) -> (B, N, 64)
+            x = torch.bmm(x, trans_feat) # (B, N, 64)
+            x = x.transpose(2, 1) # (B, N, 64) -> (B, 64, N); after feature transform
+        else:
+            trans_feat = None
+
+        pointfeat = x # final feature shape (B, 64, N)
+        x = self.act2(self.conv2(x)) # out shape (B, 128, N)
+        x = self.act3(self.conv3(x)) # out shape (B, 1024, N)
+        if self.pool == "max":
+            x = torch.max(x, 2, keepdim=True)[0] # max-pool across points dimension; shape (B, 1024, 1)
+        elif self.pool == "avg":
+            x = torch.mean(x, 2, keepdim=True) # avg-pool across points dimension; shape (B, 1024, 1)
+        x = x.view(-1, 1024) # shape (B, 1024)
+        if self.global_feat:
+            return x, trans, trans_feat
+        else:
+            # concatenating the max-pooled feature with the previously computed point-wise features
+            x = x.view(-1, 1024, 1).repeat(1, 1, n_pts)
+            return torch.cat([x, pointfeat], 1), trans, trans_feat
+
+## TODO(VS) remove classifier code
+# class PointNetClassifier(nn.Module):
+#     def __init__(self, classes=2, feature_transform=False):
+#         super(PointNetClassifier, self).__init__()
+#         self.feature_transform = feature_transform
+#         self.feat = PointNetFeat(global_feat=True, feature_transform=feature_transform)
+#         self.fc1 = nn.Linear(1024, 512)
+#         self.fc2 = nn.Linear(512, 256)
+#         self.fc3 = nn.Linear(256, classes)
+#         self.dropout = nn.Dropout(p=0.3)
+#         self.bn1 = nn.BatchNorm1d(512)
+#         self.bn2 = nn.BatchNorm1d(256)
+#         self.relu = nn.ReLU()
+
+#     def forward(self, x):
+#         x, trans, trans_feat = self.feat(x)
+#         x = F.relu(self.bn1(self.fc1(x)))
+#         x = F.relu(self.bn2(self.dropout(self.fc2(x))))
+#         x = self.fc3(x)
+#         return F.log_softmax(x, dim=1), trans, trans_feat
+
+## TODO(VS) refactor STN3d, STNkd, PointNetFeat, PointNetCore into a single PointNet class
+class PointCloudCore(EncoderCore):
+    def __init__(self, input_shape, batch_norm=True, channel_multiplier=1, pool="max"):
+        super(PointCloudCore, self).__init__(input_shape)
+        self.input_shape = input_shape
+        self.batch_norm = batch_norm
+        self.channel_multiplier = channel_multiplier
+        self.pool = pool
+        self.pointnet = PointNetFeat(global_feat_only=True, feature_transform=False, batch_norm=self.batch_norm, channel_multiplier=self.channel_multiplier, pool=self.pool)
+
+    def output_shape(self, input_shape):
+        return [1024]
+
+    def forward(self, inputs): #TODO(VS)
+        feats, _, _ = self.pointnet(inputs)
+        return feats
+    
+    ## TODO(VS)
+    # def __repr__(self):
+    #     raise NotImplementedError
+
+
+import robomimic.ndf_robot.src.ndf_robot.model as ndf_model
+class ResnetPointnetCore(EncoderCore):
+    ''' DGCNN-based VNN encoder network with ResNet blocks.
+
+    Args:
+        c_dim (int): dimension of latent code c
+        dim (int): input points dimension
+        hidden_dim (int): hidden dimension of the network
+    '''
+
+    def __init__(self, input_shape, c_dim=128, dim=3, hidden_dim=128, k=20, meta_output=None):
+        super().__init__(input_shape)
+        self._input_shape = input_shape
+        self.c_dim = c_dim
+        self.pointnet = ndf_model.VNN_ResnetPointnet(c_dim=c_dim, dim=dim, hidden_dim=hidden_dim, k=k, meta_output=meta_output)
+        
+    def output_shape(self, input_shape):
+        return [self.c_dim*3]
+
+    def forward(self, inputs):
+        output = self.pointnet(inputs)
+        batch_size = output.shape[0]
+        return output.reshape([batch_size, -1])
 
 
 """
